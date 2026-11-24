@@ -264,14 +264,142 @@ feature_zram() {
   local zsrc="$PATCHES_ROOT/zram"
   [ -d "$zsrc/lz4" ] || { feat_fail "ZRAM" "本仓库 zram/lz4 资源缺失"; return 0; }
 
-  # 4.1 升级 lib/lz4 + ARM64 NEON 解压加速（lib/ 不在任何还原列表内）
+  # ---- 前置校验：先把所有外部资源准备齐，再动内核源码 ----
+  # 顺序原则：任何可能失败的步骤都在修改内核树之前完成，
+  # 否则失败跳过会留下半应用状态，直接导致编译失败
+  # （上一版就因此在 lib/lz4 与 zram 之间留下不一致）。
+
+  local sp=/tmp/marble_sukisu_patch
+  if [ ! -d "$sp" ]; then
+    if ! git clone --depth 1 https://github.com/ShirkNeko/SukiSU_patch.git "$sp"; then
+      feat_fail "ZRAM" "SukiSU_patch 仓库克隆失败"
+      return 0
+    fi
+  fi
+
+  local vpatch_dir="$sp/other/zram/zram_patch/$KVER"
+  local -a PATCHES=()
+  local p
+  for p in lz4kd.patch lz4k_oplus.patch; do
+    if [ -f "$vpatch_dir/$p" ]; then
+      PATCHES+=("$vpatch_dir/$p")
+    else
+      echo "  [警告] 缺少 $vpatch_dir/$p"
+    fi
+  done
+  if [ ${#PATCHES[@]} -eq 0 ]; then
+    feat_fail "ZRAM" "SukiSU_patch 中没有 $KVER 的 zram 版本补丁"
+    return 0
+  fi
+
+  # 在干净副本上预演一遍：确认补丁能落到当前内核源码
+  local dry=/tmp/marble_zram_dry
+  rm -rf "$dry"
+  mkdir -p "$dry"
+  local need_files="drivers/block/zram/zram_drv.c drivers/block/zram/zram_drv.h"
+  for f in $need_files; do
+    if [ -f "$KROOT/$f" ]; then
+      mkdir -p "$dry/$(dirname "$f")"
+      cp "$KROOT/$f" "$dry/$f"
+    fi
+  done
+  if [ ! -f "$dry/drivers/block/zram/zram_drv.c" ]; then
+    rm -rf "$dry"
+    feat_fail "ZRAM" "内核树缺少 drivers/block/zram/zram_drv.c（zram 布局与补丁不匹配）"
+    return 0
+  fi
+  local dryok=0
+  for p in "${PATCHES[@]}"; do
+    if ( cd "$dry" && patch -p1 -F 3 --forward --dry-run < "$p" >/dev/null 2>&1 ); then
+      dryok=$((dryok + 1))
+    fi
+  done
+  rm -rf "$dry"
+  if [ "$dryok" -eq 0 ]; then
+    feat_fail "ZRAM" "zram 版本补丁在当前内核源码上无法应用（上下文不匹配）"
+    return 0
+  fi
+  echo "  前置校验通过：$dryok/${#PATCHES[@]} 个版本补丁可应用"
+
+  # ---- 资源齐备，开始修改内核树 ----
+  local prev_cwd="$PWD"
+
+  # 4.1 升级 lib/lz4 + ARM64 NEON 解压加速
+  #
+  # 关键：必须注册 lz4armv8 子目录的构建，否则 LZ4_arm64_decompress_safe
+  # 成为未定义符号（crypto/lz4.c 与 fs/f2fs/compress.c 会调用它），
+  # 链接阶段直接失败。不能整份覆盖上游 Makefile——marble 用
+  # CONFIG_LZ4_COMPRESS / CONFIG_LZ4_DECOMPRESS / CONFIG_LZ4HC_COMPRESS
+  # 条件编译，整份替换会导致 LZ4 模块编不出来，因此只做增量追加。
   echo "  升级 LZ4 源码..."
   rm -f "$KROOT"/lib/lz4/lz4_compress.c "$KROOT"/lib/lz4/lz4_decompress.c \
         "$KROOT"/lib/lz4/lz4defs.h "$KROOT"/lib/lz4/lz4hc_compress.c
-  cp -r "$zsrc"/lz4/* "$KROOT/lib/lz4/"
+  # 只复制源码与头文件，绝不覆盖 Makefile——zram/lz4/Makefile 用的是
+  # 无条件 obj-y，与 marble 的 CONFIG_LZ4_* 条件编译模型不兼容，
+  # 整份覆盖会让 LZ4 模块在 CONFIG_LZ4_COMPRESS=m 时编不出来。
+  cp -f "$zsrc"/lz4/lz4.c      "$KROOT/lib/lz4/" 2>/dev/null || true
+  cp -f "$zsrc"/lz4/lz4.h      "$KROOT/lib/lz4/" 2>/dev/null || true
+  cp -f "$zsrc"/lz4/lz4hc.c    "$KROOT/lib/lz4/" 2>/dev/null || true
+  cp -f "$zsrc"/lz4/lz4hc.h    "$KROOT/lib/lz4/" 2>/dev/null || true
+  cp -r "$zsrc"/lz4/lz4armv8   "$KROOT/lib/lz4/" 2>/dev/null || true
   cp -r "$zsrc"/include/linux/* "$KROOT/include/linux/" 2>/dev/null || true
 
-  local prev_cwd="$PWD"
+  # 新版 lz4.c 在 !LZ4_FREESTANDING 时依赖 ALLOC / ALLOC_AND_ZERO / FREEMEM
+  # 三个宏，由 marble 私有的 lib/lz4/lz4_kern.h 提供（走 kmalloc）。
+  # 仓库里的 lz4.c 对应 FREESTANDING=1 场景，没有这行 include，
+  # 直接替换会因宏未定义而编译失败。这里补回去。
+  local lz4src="$KROOT/lib/lz4/lz4.c"
+  if [ -f "$KROOT/lib/lz4/lz4_kern.h" ] && [ -f "$lz4src" ]; then
+    if ! grep -q '#include "lz4_kern.h"' "$lz4src"; then
+      sed -i 's|^#include "lz4.h"$|#include "lz4_kern.h"\n#include "lz4.h"|' "$lz4src"
+      if grep -q '#include "lz4_kern.h"' "$lz4src"; then
+        echo "  已为 lz4.c 补回 lz4_kern.h 引用（提供 ALLOC/FREEMEM）"
+      else
+        feat_fail "ZRAM" "lz4.c 补回 lz4_kern.h 失败（锚点 #include \"lz4.h\" 未找到）"
+        return 0
+      fi
+    fi
+  elif [ ! -f "$KROOT/lib/lz4/lz4_kern.h" ]; then
+    feat_fail "ZRAM" "内核树缺少 lib/lz4/lz4_kern.h，新版 lz4.c 的 ALLOC 宏无处定义"
+    return 0
+  fi
+
+  # lz4hc.c 同理
+  local lz4hcsrc="$KROOT/lib/lz4/lz4hc.c"
+  if [ -f "$lz4hcsrc" ] && ! grep -q '#include "lz4_kern.h"' "$lz4hcsrc"; then
+    if grep -q '#include "lz4hc.h"' "$lz4hcsrc"; then
+      sed -i 's|^#include "lz4hc.h"$|#include "lz4_kern.h"\n#include "lz4hc.h"|' "$lz4hcsrc"
+      grep -q '#include "lz4_kern.h"' "$lz4hcsrc" \
+        && echo "  已为 lz4hc.c 补回 lz4_kern.h 引用" \
+        || echo "  [警告] lz4hc.c 补回 lz4_kern.h 失败"
+    fi
+  fi
+
+  # 增量接线 lz4armv8（幂等）。放在复制之后、编译之前。
+  local lz4mk="$KROOT/lib/lz4/Makefile"
+  if [ -f "$lz4mk" ]; then
+    if ! grep -q 'lz4armv8' "$lz4mk"; then
+      {
+        echo ''
+        echo '# ARM64 NEON 加速（marble_features 追加）'
+        echo 'obj-$(CONFIG_ARM64) += $(addprefix lz4armv8/, lz4accel.o lz4armv8.o)'
+      } >> "$lz4mk"
+      echo "  已为 lib/lz4/Makefile 追加 lz4armv8 构建规则"
+    fi
+    # 上游 Makefile 的 -DLZ4_FREESTANDING=0 需要与新版源码匹配，
+    # 但保留上游取值不动，避免影响 LZ4 模块的符号可见性。
+    if ! grep -q 'LZ4_FAST_DEC_LOOP' "$lz4mk"; then
+      sed -i '1a ccflags-y += -DLZ4_FAST_DEC_LOOP=1' "$lz4mk"
+    fi
+  else
+    feat_fail "ZRAM" "lib/lz4/Makefile 缺失，无法注册 NEON 加速"
+    return 0
+  fi
+
+  # lz4_kern.h 是 marble 私有头，新版 lz4.c 若引用需保留；
+  # 复制时未覆盖它（zram/lz4 中不含该文件），此处仅做存在性提示。
+  [ -f "$KROOT/lib/lz4/lz4_kern.h" ] || echo "  [提示] lib/lz4/lz4_kern.h 不存在（上游无此文件）"
+
   cd "$KROOT" || { feat_fail "ZRAM" "无法进入内核树"; return 0; }
   if ! bash "$zsrc/apply_lz4_neon.sh"; then
     cd "$prev_cwd"
@@ -279,21 +407,12 @@ feature_zram() {
     return 0
   fi
 
-  # f2fs iostat 目标（仅当 Makefile 存在该变量集合时补齐）
+  # f2fs iostat 目标
   if [ -f fs/f2fs/Makefile ] && ! grep -qF 'f2fs-$(CONFIG_F2FS_IOSTAT) += iostat.o' fs/f2fs/Makefile; then
     echo 'f2fs-$(CONFIG_F2FS_IOSTAT) += iostat.o' >> fs/f2fs/Makefile
   fi
 
-  # 4.2 LZ4K / LZ4KD 压缩后端源码（来自 SukiSU_patch）
-  local sp=/tmp/marble_sukisu_patch
-  if [ ! -d "$sp" ]; then
-    if ! git clone --depth 1 https://github.com/ShirkNeko/SukiSU_patch.git "$sp"; then
-      cd "$prev_cwd"
-      feat_fail "ZRAM" "SukiSU_patch 仓库克隆失败"
-      return 0
-    fi
-  fi
-
+  # 4.2 LZ4K / LZ4KD 压缩后端源码
   local lz4k="$sp/other/zram/lz4k"
   if [ -d "$lz4k" ]; then
     cp -r "$lz4k"/include/linux/* "$KROOT/include/linux/" 2>/dev/null || true
@@ -304,33 +423,52 @@ feature_zram() {
     echo "  [警告] SukiSU_patch 中缺少 zram/lz4k，LZ4K 后端不可用"
   fi
 
-  # 4.3 版本补丁（把 lz4k 接入 zram 的 comp 选择）
-  local vpatch_dir="$sp/other/zram/zram_patch/$KVER"
+  # 4.3 版本补丁
   local applied=0
-  for p in lz4kd.patch lz4k_oplus.patch; do
-    if [ -f "$vpatch_dir/$p" ]; then
-      if patch -p1 -F 3 --forward < "$vpatch_dir/$p" >/dev/null 2>&1; then
-        echo "  已应用 $p"
-        applied=1
-      else
-        echo "  [警告] $p 应用失败（可能已应用或上下文漂移）"
-      fi
+  for p in "${PATCHES[@]}"; do
+    if patch -p1 -F 3 --forward < "$p" >/dev/null 2>&1; then
+      echo "  已应用 $(basename "$p")"
+      applied=$((applied + 1))
     else
-      echo "  [警告] 缺少 $vpatch_dir/$p"
+      echo "  [警告] $(basename "$p") 应用失败（上下文漂移）"
     fi
   done
   cd "$prev_cwd"
 
-  [ "$applied" = "1" ] || { feat_fail "ZRAM" "版本补丁全部未应用，LZ4K/LZ4KD 后端未接入"; return 0; }
+  if [ "$applied" -eq 0 ]; then
+    # 预演成功但实打失败：极不寻常，仍按失败处理
+    feat_fail "ZRAM" "版本补丁实际应用失败（预演与实打结果不一致）"
+    return 0
+  fi
+  echo "  已应用 $applied/${#PATCHES[@]} 个版本补丁"
 
   # 4.4 压缩后端 crypto 配置（保持 ZRAM=m）
-  set_config CONFIG_CRYPTO_LZ4HC y
-  set_config CONFIG_CRYPTO_LZ4K y
-  set_config CONFIG_CRYPTO_LZ4KD y
-  set_config CONFIG_CRYPTO_842 y
-  set_config CONFIG_CRYPTO_LZO y
-  set_config CONFIG_ZRAM_DEF_COMP_LZ4KD y
-  echo "  [OK] ZRAM 压缩后端已增强（ZRAM 仍为模块）"
+  #
+  # 只写补丁/源码确实提供、且 Kconfig 中存在对应符号的配置项。
+  # marble 原树的 drivers/block/zram/Kconfig 没有 ZRAM_DEF_COMP_LZ4KD
+  # 这类条目——它们由 lz4kd 补丁动态生成；补丁没打上就写这个 config
+  # 会让 defconfig 校验失败（符号未定义），直接导致编译中断。
+  local wrote=0
+  for _kv in CRYPTO_LZ4HC:y CRYPTO_LZ4K:y CRYPTO_LZ4KD:y CRYPTO_842:y CRYPTO_LZO:y; do
+    local _k="${_kv%%:*}" _v="${_kv##*:}"
+    if config_defined "CONFIG_$_k"; then
+      set_config "CONFIG_$_k" "$_v"
+      wrote=$((wrote + 1))
+    else
+      echo "  [跳过] 当前内核未声明 CONFIG_$_k"
+    fi
+  done
+
+  # 默认压缩算法只在对应后端确实可用时才指定
+  if config_defined CONFIG_ZRAM_DEF_COMP_LZ4KD; then
+    set_config CONFIG_ZRAM_DEF_COMP_LZ4KD y
+    wrote=$((wrote + 1))
+  else
+    echo "  [跳过] 当前内核未声明 CONFIG_ZRAM_DEF_COMP_LZ4KD（lz4kd 补丁未提供该选项）"
+  fi
+
+  unset _kv _k _v
+  echo "  [OK] ZRAM 压缩后端已增强（写入 $wrote 项配置；ZRAM 仍为模块）"
 }
 
 # ================================================================
@@ -352,14 +490,17 @@ feature_net() {
     NETFILTER_XT_MATCH_RECENT IP6_NF_NAT IP6_NF_TARGET_MASQUERADE; do
     enable_if_defined "CONFIG_$cfg"
   done
-  set_config CONFIG_IP_SET_MAX 65534
+  config_defined CONFIG_IP_SET_MAX && set_config CONFIG_IP_SET_MAX 65534
 
   for cfg in TCP_CONG_ADVANCED TCP_CONG_BBR TCP_CONG_CUBIC \
     TCP_CONG_BIC TCP_CONG_WESTWOOD TCP_CONG_HTCP; do
     enable_if_defined "CONFIG_$cfg"
   done
-  set_config CONFIG_DEFAULT_BBR y
-  set_config CONFIG_DEFAULT_TCP_CONG '"bbr"'
+  # DEFAULT_BBR 是 choice 成员，需要其所在 choice 也存在
+  if config_defined CONFIG_DEFAULT_BBR; then
+    set_config CONFIG_DEFAULT_BBR y
+    set_config CONFIG_DEFAULT_TCP_CONG '"bbr"'
+  fi
 
   for cfg in NET_SCH_FQ NET_SCH_FQ_CODEL NET_SCH_CAKE NET_ACT_CONNMARK \
     IP_NF_TARGET_TTL IP6_NF_TARGET_HL IP6_NF_MATCH_HL WIREGUARD; do
@@ -370,8 +511,14 @@ feature_net() {
     enable_if_defined "CONFIG_$cfg"
   done
 
-  grep -q '^CONFIG_IP_SET=y$' "$DEFCONFIG" || { feat_fail "网络增强" "IPSet 写入校验失败"; return 0; }
-  grep -q '^CONFIG_NET_SCH_FQ=y$' "$DEFCONFIG" || { feat_fail "网络增强" "FQ qdisc 写入校验失败"; return 0; }
+  # 写后校验：只在 Kconfig 确实声明了该符号时才要求落盘，
+  # 否则「跳过」被误判成「写入失败」。
+  if config_defined CONFIG_IP_SET; then
+    grep -q '^CONFIG_IP_SET=y$' "$DEFCONFIG" || { feat_fail "网络增强" "IPSet 写入校验失败"; return 0; }
+  fi
+  if config_defined CONFIG_NET_SCH_FQ; then
+    grep -q '^CONFIG_NET_SCH_FQ=y$' "$DEFCONFIG" || { feat_fail "网络增强" "FQ qdisc 写入校验失败"; return 0; }
+  fi
   echo "  [OK] 网络增强配置已写入（BBRv3 未接入，默认 bbr v1）"
 }
 

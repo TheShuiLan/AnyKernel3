@@ -97,14 +97,15 @@ on:
         type: string
         default: ""
       ksu_mode:
-        description: "KernelSU / SUSFS 模式（关闭=基础+KSU+KSU&SUSFS 三份；禁用SUSFS=基础+KSU；禁用KSU=仅基础）"
+        description: "KernelSU / SUSFS 模式（仅SUSFS=只编 KernelSU+SUSFS 一份，最快；关闭=编基础+KSU+KSU&SUSFS 三份）"
         required: true
         type: choice
         options:
+          - "仅SUSFS"
           - "关闭"
           - "禁用SUSFS"
           - "禁用KSU"
-        default: "关闭"
+        default: "仅SUSFS"
 
       # ==================== 功能补丁 ====================
       use_zram:
@@ -206,28 +207,38 @@ jobs:
 
       - name: 推导构建变体
         run: |
-          # ksu_mode 推出三份产物的构建意图：
+          # ksu_mode 推出产物的构建意图：
+          #   仅SUSFS    -> 只编 KSU+SUSFS 一份（省两轮编译，产物仍占满三个槽位）
           #   关闭       -> 基础 + KSU + KSU&SUSFS
           #   禁用SUSFS  -> 基础 + KSU
           #   禁用KSU    -> 仅基础
           case "${{ inputs.ksu_mode }}" in
+            "仅SUSFS")
+              echo "BUILD_BASE=false"  >> $GITHUB_ENV
+              echo "BUILD_KSU=false"   >> $GITHUB_ENV
+              echo "BUILD_SUSFS=true"  >> $GITHUB_ENV
+              echo "SINGLE_VARIANT=true" >> $GITHUB_ENV
+              ;;
             "禁用KSU")
               echo "BUILD_BASE=true"  >> $GITHUB_ENV
               echo "BUILD_KSU=false"  >> $GITHUB_ENV
               echo "BUILD_SUSFS=false" >> $GITHUB_ENV
+              echo "SINGLE_VARIANT=false" >> $GITHUB_ENV
               ;;
             "禁用SUSFS")
               echo "BUILD_BASE=true"  >> $GITHUB_ENV
               echo "BUILD_KSU=true"   >> $GITHUB_ENV
               echo "BUILD_SUSFS=false" >> $GITHUB_ENV
+              echo "SINGLE_VARIANT=false" >> $GITHUB_ENV
               ;;
             *)
               echo "BUILD_BASE=true"  >> $GITHUB_ENV
               echo "BUILD_KSU=true"   >> $GITHUB_ENV
               echo "BUILD_SUSFS=true" >> $GITHUB_ENV
+              echo "SINGLE_VARIANT=false" >> $GITHUB_ENV
               ;;
           esac
-          echo "构建变体: 基础=$BUILD_BASE KSU=$BUILD_KSU SUSFS=$BUILD_SUSFS"
+          echo "构建变体已写入 GITHUB_ENV（基础/KSU/SUSFS/单一变体）"
 
       # e652cd9 改用 Slim LLVM 时移除了 checkout，此后 workflow 一直无法
       # 访问本仓库文件；security_patch/ 与 scripts/ 的引用全部落空
@@ -596,9 +607,15 @@ jobs:
           cp -f out/arch/arm64/boot/Image "$OUT_DIR/Image_susfs"
           cp -f out/vmlinux.symvers "$OUT_DIR/Image_susfs_vmlinux.symvers"
 
-          # 本轮同样把 $OUT_DIR/Image 覆盖成 SUSFS 版，
-          # 用基础版备份还原，保证打包时 Image=基础版。
-          if [ -f "$OUT_DIR/Image.base" ]; then
+          # 单一变体模式（仅SUSFS）下没有基础版与 KSU 版，
+          # 用 SUSFS 产物占位，保证 make_package.py 的三个槽位都有镜像。
+          if [ "$SINGLE_VARIANT" = "true" ]; then
+            cp -f "$OUT_DIR/Image_susfs" "$OUT_DIR/Image"
+            cp -f "$OUT_DIR/Image_susfs" "$OUT_DIR/Image_ksu"
+            echo "单一变体模式：Image / Image_ksu 均以 SUSFS 产物占位"
+          elif [ -f "$OUT_DIR/Image.base" ]; then
+            # 本轮同样把 $OUT_DIR/Image 覆盖成 SUSFS 版，
+            # 用基础版备份还原，保证打包时 Image=基础版。
             cp -f "$OUT_DIR/Image.base" "$OUT_DIR/Image"
             echo "已还原 $OUT_DIR/Image 为基础版"
           fi
