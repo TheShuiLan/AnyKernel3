@@ -1,0 +1,450 @@
+# ========================================
+# Melt Kernel 构建（Redmi Note 12 Turbo / Poco F5）
+# ========================================
+# 上游: https://github.com/Pzqqt/android_kernel_xiaomi_marble
+# 分支: melt-rebase   内核版本: 5.10.274   设备代号: marble / marblein
+#
+# 与 main.yml 的差别：main.yml 走 GKI（repo + kleaf），本工作流是
+# 设备树（非 GKI），用 make + marble_defconfig + LLVM 工具链直接编译，
+# 产出 Image / dtb / dtbo，再打成 AnyKernel3 卡刷包。
+# ========================================
+
+name: 构建 Melt 内核
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+  actions: write
+
+on:
+  workflow_dispatch:
+    inputs:
+      # ==================== 源码配置 ====================
+      kernel_repo:
+        description: "内核源码仓库"
+        required: false
+        type: string
+        default: "https://github.com/Pzqqt/android_kernel_xiaomi_marble.git"
+      kernel_branch:
+        description: "源码分支"
+        required: false
+        type: string
+        default: "melt-rebase"
+      kernel_commit:
+        description: "指定提交（留空=跟随分支 HEAD）"
+        required: false
+        type: string
+        default: ""
+
+      # ==================== 编译配置 ====================
+      defconfig:
+        description: "defconfig 名称（arch/arm64/configs/ 下）"
+        required: false
+        type: string
+        default: "marble_defconfig"
+      clang_version:
+        description: "Clang 版本"
+        required: false
+        type: choice
+        options:
+          - "clang-r416183b"
+          - "clang-r487747c"
+          - "clang-r510928"
+        default: "clang-r416183b"
+      extra_configs:
+        description: "追加 config（空格分隔，如 CONFIG_X=y CONFIG_Y=n）"
+        required: false
+        type: string
+        default: ""
+
+      # ==================== KernelSU ====================
+      use_kernelsu:
+        description: "集成 KernelSU"
+        required: true
+        type: boolean
+        default: false
+      kernelsu_variant:
+        description: "KernelSU 变体"
+        required: false
+        type: choice
+        options:
+          - "SukiSU-Nova"
+          - "BakaSU"
+          - "FinaSU"
+        default: "SukiSU-Nova"
+      kernelsu_branch:
+        description: "KernelSU setup.sh 使用的分支（main / builtin）"
+        required: false
+        type: string
+        default: "main"
+
+      # ==================== 打包配置 ====================
+      release_type:
+        description: "发布类型"
+        required: true
+        type: choice
+        options:
+          - Actions
+          - Pre-Release
+          - Release
+        default: Actions
+      artifact_upload_mode:
+        description: "产物上传模式"
+        required: true
+        type: choice
+        options:
+          - "仅上传 AnyKernel3.zip"
+          - "上传全部"
+        default: "仅上传 AnyKernel3.zip"
+
+env:
+  KERNEL_REPO: ${{ inputs.kernel_repo }}
+  KERNEL_BRANCH: ${{ inputs.kernel_branch }}
+  DEFCONFIG: ${{ inputs.defconfig }}
+  CLANG_VERSION: ${{ inputs.clang_version }}
+
+jobs:
+  # ==================== 构建 ====================
+  build-marble:
+    name: "Melt ${{ inputs.kernel_branch }}"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    steps:
+      - name: 构建信息摘要
+        run: |
+          {
+            echo "## Melt Kernel 构建"
+            echo ""
+            echo "| 项目 | 值 |"
+            echo "|:---|:---|"
+            echo "| 源码 | $KERNEL_REPO |"
+            echo "| 分支 | $KERNEL_BRANCH |"
+            echo "| 提交 | ${{ inputs.kernel_commit || 'HEAD' }} |"
+            echo "| defconfig | $DEFCONFIG |"
+            echo "| Clang | $CLANG_VERSION |"
+            echo "| KernelSU | ${{ inputs.use_kernelsu && inputs.kernelsu_variant || '未集成' }} |"
+            echo "| 运行 | [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |"
+          } >> $GITHUB_STEP_SUMMARY
+
+      - name: 清理磁盘空间
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android/sdk/ndk \
+            /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          df -h /
+
+      - name: 检出本仓库
+        uses: actions/checkout@v7
+
+      - name: 安装编译依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential ccache cpio curl flex git libelf-dev \
+            libssl-dev libncurses-dev lz4 python3 rsync unzip zip zstd
+
+      - name: 下载 Clang 工具链
+        run: |
+          set -euo pipefail
+          URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/${CLANG_VERSION}.tar.gz"
+          echo "下载 $CLANG_VERSION ..."
+          curl -L --retry 5 --retry-delay 5 -o clang.tar.gz "$URL"
+          mkdir -p "$GITHUB_WORKSPACE/toolchain"
+          tar -xzf clang.tar.gz -C "$GITHUB_WORKSPACE/toolchain"
+          rm -f clang.tar.gz
+          "$GITHUB_WORKSPACE/toolchain/bin/clang" --version
+
+      - name: 克隆内核源码
+        run: |
+          set -euo pipefail
+          git clone --depth=1 -b "$KERNEL_BRANCH" "$KERNEL_REPO" kernel
+          cd kernel
+          if [ -n "${{ inputs.kernel_commit }}" ]; then
+            git fetch --depth=1 origin "${{ inputs.kernel_commit }}"
+            git checkout "${{ inputs.kernel_commit }}"
+          fi
+          echo "KERNEL_SHA=$(git rev-parse HEAD)" >> $GITHUB_ENV
+          echo "KERNEL_SHORT=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+
+      - name: 配置 ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ inputs.defconfig }}-${{ inputs.clang_version }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-${{ inputs.defconfig }}-${{ inputs.clang_version }}-
+
+      - name: 配置编译器
+        run: |
+          echo "$GITHUB_WORKSPACE/toolchain/bin" >> $GITHUB_PATH
+          {
+            echo "CC=clang"
+            echo "CXX=clang++"
+            echo "AR=llvm-ar"
+            echo "NM=llvm-nm"
+            echo "OBJCOPY=llvm-objcopy"
+            echo "OBJDUMP=llvm-objdump"
+            echo "STRIP=llvm-strip"
+            echo "READELF=llvm-readelf"
+            echo "LLVM_IAS=1"
+          } >> $GITHUB_ENV
+
+      - name: 生成 defconfig
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          make -j$(nproc --all) \
+            ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+            O=out "$DEFCONFIG"
+
+          if [ -n "${{ inputs.extra_configs }}" ]; then
+            echo "追加 config: ${{ inputs.extra_configs }}"
+            cd out
+            for cfg in ${{ inputs.extra_configs }}; do
+              ./scripts/config --file .config $cfg
+            done
+            cd ..
+            make -j$(nproc --all) ARCH=arm64 LLVM=1 LLVM_IAS=1 O=out olddefconfig
+          fi
+
+          echo "=== 最终 KERNELRELEASE ==="
+          grep -E '^CONFIG_LOCALVERSION=' out/.config || true
+
+      - name: 集成 KernelSU
+        if: inputs.use_kernelsu
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          case "${{ inputs.kernelsu_variant }}" in
+            "SukiSU-Nova")
+              # 该 Forgejo 实例对 /<owner>/<repo>.git 的 smart-HTTP 返回 401，
+              # 不带 .git 后缀才可匿名拉取
+              URL="https://git.zako.shirkneko.top:20004/shirkneko/SukiSU/raw/branch/main/kernel/setup.sh"
+              ;;
+            "BakaSU")
+              URL="https://raw.githubusercontent.com/Baka-SU/BakaSU/main/kernel/setup.sh"
+              ;;
+            "FinaSU")
+              URL="https://raw.githubusercontent.com/LyraVoid/FinaSU/master/kernel/setup.sh"
+              ;;
+            *)
+              echo "::error::未知变体: ${{ inputs.kernelsu_variant }}"
+              exit 1
+              ;;
+          esac
+
+          curl -LSs "$URL" | bash -s -- "${{ inputs.kernelsu_branch }}"
+
+      - name: 编译内核
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          make -j$(nproc --all) \
+            ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+            O=out \
+            CC="ccache clang" \
+            Image.gz dtbo.img dtb.img 2>&1 | tee build.log
+
+      - name: 整理编译失败日志
+        if: failure()
+        run: |
+          mkdir -p fail-logs
+          cp kernel/build.log fail-logs/ 2>/dev/null || true
+          cp kernel/out/.config fail-logs/ 2>/dev/null || true
+          tail -n 300 kernel/build.log > fail-logs/tail.txt 2>/dev/null || true
+
+      - name: 上传编译失败日志
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: Melt-Build-Logs
+          path: fail-logs/*
+          if-no-files-found: ignore
+
+      - name: 准备产物
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          OUT=kernel/out/arch/arm64/boot
+
+          # 内核镜像：优先 Image.gz，退回 Image
+          if [ -f "$OUT/Image.gz" ]; then
+            cp "$OUT/Image.gz" artifacts/Image.gz
+            echo "IMAGE=Image.gz" >> $GITHUB_ENV
+          elif [ -f "$OUT/Image" ]; then
+            cp "$OUT/Image" artifacts/Image
+            echo "IMAGE=Image" >> $GITHUB_ENV
+          else
+            echo "::error::未找到 Image / Image.gz"
+            ls -la "$OUT" || true
+            exit 1
+          fi
+
+          # dtb / dtbo：设备树可能合并成 dtb.img，也可能散装
+          for f in dtbo.img dtb.img; do
+            [ -f "$OUT/$f" ] && cp "$OUT/$f" artifacts/
+          done
+          if compgen -G "$OUT/dts/*/*.dtb" > /dev/null 2>&1; then
+            mkdir -p artifacts/dtb
+            find "$OUT/dts" -name '*.dtb' -exec cp {} artifacts/dtb/ \;
+          fi
+
+          ls -lh artifacts
+
+      - name: 创建 AnyKernel3 刷入包
+        run: |
+          set -euo pipefail
+          # 用 osm0sis 官方原版模板（非 WildKernels 的 GKI 定制版）：
+          # marble 是设备树内核，需用 flash_boot 保留原 ramdisk 只替换内核；
+          # WildKernels 的 gki-2.0 模板含 GKI 硬编码检查与广告，不适用。
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git ak3
+          rm -rf ak3/.git ak3/README.md
+
+          # 模板自带的示例 ramdisk/patch 内容用不到
+          rm -rf ak3/ramdisk ak3/patch ak3/modules
+
+          cp "artifacts/$IMAGE" ak3/
+          [ -f artifacts/dtbo.img ] && cp artifacts/dtbo.img ak3/
+          [ -f artifacts/dtb.img ] && cp artifacts/dtb.img ak3/
+
+          # 用 marble 的配置重写 anykernel.sh
+          cat > ak3/anykernel.sh <<'AK3EOF'
+          ### AnyKernel3 Ramdisk Mod Script
+          ## osm0sis @ xda-developers
+
+          properties() { '
+          kernel.string=Melt Kernel (marble)
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=0
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=marble
+          device.name2=marblein
+          device.name3=
+          device.name4=
+          device.name5=
+          supported.versions=12,13
+          supported.patchlevels=
+          supported.vendorpatchlevels=
+          '; } # end properties
+
+          ## boot shell variables
+          BLOCK=boot
+          IS_SLOT_DEVICE=auto
+          RAMDISK_COMPRESSION=auto
+          PATCH_VBMETA_FLAG=auto
+
+          # import functions/variables and setup patching (DO NOT REMOVE)
+          . tools/ak3-core.sh
+
+          # marble 为设备树内核，用 flash_boot 保留原 ramdisk，只替换 kernel/dtb
+          split_boot
+          flash_boot
+          ## end boot install
+          AK3EOF
+
+          chmod +x ak3/anykernel.sh
+          bash -n ak3/anykernel.sh
+
+          ZIP_NAME="Melt-${KERNEL_SHORT}-${DEFCONFIG%-defconfig}"
+          if [ "${{ inputs.use_kernelsu }}" = "true" ]; then
+            ZIP_NAME="${ZIP_NAME}-KSU"
+          fi
+
+          (cd ak3 && zip -r -q -9 "../${ZIP_NAME}-AnyKernel3.zip" .)
+          echo "ZIP_NAME=$ZIP_NAME" >> $GITHUB_ENV
+          ls -lh "${ZIP_NAME}-AnyKernel3.zip"
+
+      - name: 整理产物目录
+        run: |
+          set -euo pipefail
+          mkdir -p package
+          cp "${ZIP_NAME}-AnyKernel3.zip" package/
+          if [ "${{ inputs.artifact_upload_mode }}" = "上传全部" ]; then
+            cp artifacts/* package/ 2>/dev/null || true
+          fi
+          ls -lh package
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ env.ZIP_NAME }}-AnyKernel3
+          path: package/*
+          if-no-files-found: error
+
+      - name: 构建摘要
+        if: always()
+        run: |
+          {
+            echo ""
+            echo "### 结果"
+            echo ""
+            echo "- 内核提交: \`${KERNEL_SHA:-unknown}\`"
+            echo "- 产物: \`${ZIP_NAME}-AnyKernel3.zip\`"
+          } >> $GITHUB_STEP_SUMMARY
+
+  # ==================== 发布 ====================
+  release:
+    if: ${{ always() && !cancelled() && inputs.release_type != 'Actions' && needs.build-marble.result == 'success' }}
+    needs: build-marble
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ secrets.WORKFLOW_PUSH_TOKEN || secrets.GITHUB_TOKEN }}
+      REPO_OWNER: ${{ github.repository_owner }}
+      REPO_NAME: ${{ github.event.repository.name }}
+
+    steps:
+      - name: 下载产物
+        uses: actions/download-artifact@v8
+        with:
+          path: ./downloaded
+
+      - name: 生成版本标签
+        run: |
+          set -euo pipefail
+          BASE="melt-$(date -u '+%Y%m%d')"
+          FULL_TAG=""
+          for i in 1 2 3; do
+            FULL_TAG=$(gh api "repos/$REPO_OWNER/$REPO_NAME/tags" --jq '.[0].name' 2>/dev/null) && [ -n "$FULL_TAG" ] && break
+            FULL_TAG=""; sleep 3
+          done
+          if [[ "$FULL_TAG" == "$BASE"-r* ]]; then
+            R=$(echo "$FULL_TAG" | sed 's/.*-r//'); R=$((R + 1))
+          else
+            R=1
+          fi
+          echo "NEW_TAG=${BASE}-r${R}" >> $GITHUB_ENV
+
+      - name: 创建 Release
+        run: |
+          set -euo pipefail
+          FLAGS=""
+          [ "${{ inputs.release_type }}" = "Pre-Release" ] && FLAGS="--prerelease"
+          gh release create "$NEW_TAG" \
+            --title "Melt Kernel $NEW_TAG" \
+            --notes "Melt Kernel for Redmi Note 12 Turbo (marble) / Poco F5 (marblein)
+
+          - 源码: ${{ inputs.kernel_repo }} @ ${{ inputs.kernel_branch }}
+          - defconfig: ${{ inputs.defconfig }}
+          - Clang: ${{ inputs.clang_version }}
+          - KernelSU: ${{ inputs.use_kernelsu && inputs.kernelsu_variant || '未集成' }}
+
+          > 刷入前请备份原厂 boot 镜像。" \
+            --target "$GITHUB_SHA" $FLAGS
+
+      - name: 上传资产
+        run: |
+          set -euo pipefail
+          find ./downloaded -type f -name '*.zip' -print0 | while IFS= read -r -d '' f; do
+            echo "上传 $f"
+            gh release upload "$NEW_TAG" "$f" --clobber
+          done
+
+      - name: 发布摘要
+        run: |
+          echo "- **标签**: $NEW_TAG" >> $GITHUB_STEP_SUMMARY
+          echo "- **链接**: ${{ github.server_url }}/$REPO_OWNER/$REPO_NAME/releases/tag/$NEW_TAG" >> $GITHUB_STEP_SUMMARY
