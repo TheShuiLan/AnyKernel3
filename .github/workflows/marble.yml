@@ -594,10 +594,25 @@ jobs:
           if ! grep -q '^CONFIG_KSU=y$' "arch/arm64/configs/$DEFCONFIG"; then
             echo "CONFIG_KSU=y" >> "arch/arm64/configs/$DEFCONFIG"
           fi
+          # Kconfig 位置随变体布局不同：
+          #   tiann        drivers/kernelsu/kernel/Kconfig
+          #   官方三家     drivers/kernelsu/Kconfig（软链到 KernelSU/kernel）
+          KSU_KCONFIG=""
+          for _k in drivers/kernelsu/kernel/Kconfig drivers/kernelsu/Kconfig; do
+            [ -f "$_k" ] && { KSU_KCONFIG="$_k"; break; }
+          done
+          unset _k
+          if [ -z "$KSU_KCONFIG" ]; then
+            echo "::error::未找到 KernelSU 的 Kconfig（drivers/kernelsu*/Kconfig）"
+            ls -la drivers/kernelsu* 2>/dev/null || true
+            exit 1
+          fi
+          echo "KernelSU Kconfig: $KSU_KCONFIG"
+
           for _c in KSU_SUSFS KSU_SUSFS_SUS_PATH KSU_SUSFS_SUS_MOUNT KSU_SUSFS_SUS_KSTAT \
                     KSU_SUSFS_SPOOF_UNAME KSU_SUSFS_ENABLE_LOG KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS \
                     KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG KSU_SUSFS_OPEN_REDIRECT KSU_SUSFS_SUS_MAP; do
-            grep -qE "^[[:space:]]*config[[:space:]]+${_c}\$" drivers/kernelsu/kernel/Kconfig 2>/dev/null \
+            grep -qE "^[[:space:]]*config[[:space:]]+${_c}\$" "$KSU_KCONFIG" 2>/dev/null \
               && ! grep -q "^CONFIG_${_c}=y\$" "arch/arm64/configs/$DEFCONFIG" \
               && echo "CONFIG_${_c}=y" >> "arch/arm64/configs/$DEFCONFIG"
           done

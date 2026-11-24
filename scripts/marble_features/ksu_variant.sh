@@ -123,33 +123,59 @@ fi
 echo "  KSU commit: $(git -C "$KSU_DIR" rev-parse --short HEAD)"
 [ -d "$KSU_DIR/kernel" ] || def_fail "KernelSU 仓库缺少 kernel/ 目录"
 
-# ---- 3. 按 build_bouquet.sh 的布局接入 drivers/kernelsu ----
+# ---- 3. 接入 drivers/kernelsu（按变体选择正确布局） ----
+#
+# 上游各变体的集成布局并不一致，混用会导致头文件找不到：
+#
+#   tiann        build_bouquet.sh 布局：cp kernel/ -> drivers/kernelsu/kernel/
+#                其 Makefile 用 $(srctree)/$(src)/include，多一层无妨。
+#
+#   bakasu       官方 setup.sh 布局：软链 KernelSU/kernel -> drivers/kernelsu
+#   sukisu-nova  同上。注意 SukiSU-Nova 的 Makefile 在 CONFIG_KSU_SUSFS=y 时
+#   finasu       硬编码 -I$(srctree)/drivers/kernelsu/include，多一层就会
+#                报 'arch.h' file not found（本仓库此前的实际故障）。
+#
+# 因此官方三家用软链布局，与各自 setup.sh 完全一致；tiann 保持原布局。
 rm -rf "$KROOT/drivers/kernelsu"
-mkdir -p "$KROOT/drivers/kernelsu"
-ln -s "$KSU_DIR/.git" "$KROOT/drivers/kernelsu/.git"
-cp -r "$KSU_DIR/kernel" "$KROOT/drivers/kernelsu/kernel"
-[ -d "$KSU_DIR/uapi" ] && cp -r "$KSU_DIR/uapi" "$KROOT/drivers/kernelsu/uapi"
+
+if [ "$VARIANT" = "tiann" ]; then
+  mkdir -p "$KROOT/drivers/kernelsu"
+  cp -r "$KSU_DIR/kernel" "$KROOT/drivers/kernelsu/kernel"
+  [ -d "$KSU_DIR/uapi" ] && cp -r "$KSU_DIR/uapi" "$KROOT/drivers/kernelsu/uapi" || true
+  KSU_KCONFIG_REL="drivers/kernelsu/kernel/Kconfig"
+  KSU_MAKE_LINE='obj-y += kernelsu/kernel/'
+  echo "  布局: drivers/kernelsu/kernel/（build_bouquet 风格）"
+else
+  # 软链：drivers/kernelsu -> KernelSU/kernel
+  ln -sfn "$(realpath --relative-to="$KROOT/drivers" "$KSU_DIR/kernel")" \
+    "$KROOT/drivers/kernelsu"
+  KSU_KCONFIG_REL="drivers/kernelsu/Kconfig"
+  KSU_MAKE_LINE='obj-$(CONFIG_KSU) += kernelsu/'
+  echo "  布局: drivers/kernelsu -> KernelSU/kernel（官方 setup.sh 风格）"
+  [ -d "$KROOT/drivers/kernelsu" ] || def_fail "drivers/kernelsu 软链创建失败（KernelSU/kernel 不存在？）"
+  [ -f "$KROOT/drivers/kernelsu/Kconfig" ] || def_fail "软链后 drivers/kernelsu/Kconfig 不可达"
+fi
 
 # 接线（幂等）
 # 锚点优先用 drivers/most/Kconfig（build_bouquet.sh 的原写法，
 # marble melt-rebase 的 drivers/Kconfig:239 存在该行）；
 # 缺失时退到该 menu 的 endmenu 前插入，避免静默漏接。
-if ! grep -qF 'source "drivers/kernelsu/kernel/Kconfig"' "$KROOT/drivers/Kconfig"; then
+if ! grep -qF "source \"$KSU_KCONFIG_REL\"" "$KROOT/drivers/Kconfig"; then
   if grep -qF 'source "drivers/most/Kconfig"' "$KROOT/drivers/Kconfig"; then
-    sed -i '/source "drivers\/most\/Kconfig"/a source "drivers/kernelsu/kernel/Kconfig"' "$KROOT/drivers/Kconfig"
+    sed -i "\|source \"drivers/most/Kconfig\"|a source \"$KSU_KCONFIG_REL\"" "$KROOT/drivers/Kconfig"
   else
-    sed -i '/^endmenu$/i source "drivers/kernelsu/kernel/Kconfig"' "$KROOT/drivers/Kconfig"
+    sed -i "/^endmenu\$/i source \"$KSU_KCONFIG_REL\"" "$KROOT/drivers/Kconfig"
     echo "  [警告] drivers/Kconfig 无 most/Kconfig 锚点，改在 endmenu 前插入"
   fi
 fi
-grep -qF 'source "drivers/kernelsu/kernel/Kconfig"' "$KROOT/drivers/Kconfig" \
+grep -qF "source \"$KSU_KCONFIG_REL\"" "$KROOT/drivers/Kconfig" \
   || def_fail "drivers/Kconfig 接线失败"
-grep -qF 'obj-y += kernelsu/kernel/' "$KROOT/drivers/Makefile" \
-  || echo 'obj-y += kernelsu/kernel/' >> "$KROOT/drivers/Makefile"
+grep -qF "$KSU_MAKE_LINE" "$KROOT/drivers/Makefile" \
+  || echo "$KSU_MAKE_LINE" >> "$KROOT/drivers/Makefile"
 
 # ---- 4. FinaSU 管理器证书注入（第二信任槽） ----
 if [ "$VARIANT" = "finasu" ]; then
-  KBUILD="$KROOT/drivers/kernelsu/kernel/Kbuild"
+  KBUILD="$KROOT/drivers/kernelsu/Kbuild"
   if [ -n "$KSU_CERT_SIZE" ] && [ -n "$KSU_CERT_HASH" ]; then
     if grep -q '^KSU_EXPECTED_SIZE2 := ' "$KBUILD" 2>/dev/null; then
       echo "  FinaSU 证书槽已存在，跳过注入"
