@@ -406,32 +406,59 @@ jobs:
           # 这两个模块因此既不进 vendor_boot_modules 也不进 vendor_dlkm_modules，
           # 随后 make_package.py 的模块加载模拟因清单里缺文件而失败。
           #
-          # 做法：按“文件名在源码树中的实际位置”重写清单行，幂等且不依赖目录名。
+          # 定位方式：.ko 是编译产物，源码树里只有 .c，因此不能 find *.ko。
+          # 改为在源码树里找哪个 Makefile 声明了
+          #   obj-... += <模块名>.o
+          # 该 Makefile 所在目录即 .ko 的编译输出目录。这样不写死目录名，
+          # 上游调整目录结构时也能自动适配。
           echo "=== 校正模块收集路径 ==="
-          for pair in \
-            "goodix_core.ko:drivers/input/touchscreen" \
-            "xiaomi_touch.ko:drivers/input/touchscreen"; do
-            _ko="${pair%%:*}"
-            _base="${pair##*:}"
-            _real=$(find "$_base" -type f -name "$_ko" 2>/dev/null | head -1)
-            if [ -z "$_real" ]; then
-              echo "  [警告] 源码树中找不到 $_ko（可能该机型未包含此驱动）"
+
+          # 根据模块名定位其在内核树中的真实输出目录。
+          # 注意同一模块名可能被多个 Makefile 声明（marble 的
+          # goodix_core.o 同时存在于 goodix_9916r/ 和 goodix_berlin_driver/），
+          # 必须结合 defconfig 判断哪个 CONFIG 真正被启用，
+          # 否则可能选到没参与编译的目录。
+          find_module_dir() {
+            local mod="$1"
+            local mk cfg
+            while IFS= read -r mk; do
+              [ -n "$mk" ] || continue
+              # 取该行声明的 CONFIG_xxx
+              cfg=$(grep -oE 'CONFIG_[A-Z0-9_]+' "$mk" | head -1)
+              if [ -z "$cfg" ]; then
+                continue
+              fi
+              # defconfig 中该 CONFIG 为 y 或 m 才说明会参与编译
+              if grep -qE "^${cfg}=[ym]\$" "arch/arm64/configs/$DEFCONFIG"; then
+                dirname "$mk" | sed 's|^\./||'
+                return 0
+              fi
+            done < <(grep -rlE "^[[:space:]]*obj-[^:=]*\+=[[:space:]]*(.*[[:space:]])?${mod}\.o([[:space:]]|\$)" \
+                       --include=Makefile --include=Kbuild drivers 2>/dev/null)
+            return 1
+          }
+
+          for ko in goodix_core.ko xiaomi_touch.ko; do
+            mod="${ko%.ko}"
+            dir=$(find_module_dir "$mod") || {
+              echo "  [警告] 没有已启用的 CONFIG 声明 ${mod}.o（该机型可能不含此驱动）"
+              continue
+            }
+            want="${dir}/${ko}"
+            if grep -qxF "$want" build_bouquet.sh; then
+              echo "  $ko 路径已正确: $want"
               continue
             fi
-            _want="${_real#./}"
-            if grep -qxF "$_want" build_bouquet.sh; then
-              echo "  $_ko 路径已正确: $_want"
-              continue
-            fi
-            # 找到清单里引用该文件名的那一行并整行替换
-            _old=$(grep -E "^drivers/.*/${_ko}\$" build_bouquet.sh | head -1)
-            if [ -n "$_old" ]; then
-              sed -i "s|^${_old}\$|${_want}|" build_bouquet.sh
-              echo "  $_ko: $_old -> $_want"
+            old=$(grep -E "^[^[:space:]]*/${ko}\$" build_bouquet.sh | head -1)
+            if [ -n "$old" ]; then
+              sed -i "s|^${old}\$|${want}|" build_bouquet.sh
+              echo "  $ko: $old -> $want"
             else
-              echo "  [警告] 清单中没有 $_ko 条目，跳过（不影响，模板清单可能已更新）"
+              echo "  [警告] 清单中没有 $ko 条目，跳过"
             fi
           done
+          echo "=== 校正后清单中的两条 ==="
+          grep -E "(goodix_core|xiaomi_touch)\.ko" build_bouquet.sh || true
 
       - name: 应用自定义版本后缀
         if: inputs.version_suffix != ''
