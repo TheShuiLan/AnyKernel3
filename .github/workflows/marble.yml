@@ -170,7 +170,11 @@ env:
   DEFCONFIG: ${{ inputs.defconfig }}
   SLIM_LLVM: ${{ inputs.slim_llvm_version }}
   # 上游脚本的产物目录
-  OUT_DIR: ${{ github.workspace }}/build_toolchain/Bouquet_marble_out
+  # 上游 build_bouquet.sh 的 OUTPUT_DIR 写作 ~/Bouquet_marble_out，
+  # 即 $HOME 下。GitHub Actions 的 env 不做 shell 展开，因此这里不定义
+  # OUT_DIR，改为各步骤内 export OUT_DIR="$HOME/Bouquet_marble_out"。
+  # 此前写成 ${{ github.workspace }}/build_toolchain/... 与之不符，
+  # 导致所有 $OUT_DIR 拷贝都指向不存在的目录（编译成功后才暴露）。
   SKIP_INCOMPATIBLE: ${{ inputs.skip_incompatible }}
 
 jobs:
@@ -515,17 +519,19 @@ jobs:
         run: |
           set -euo pipefail
           export PATH="$LLVM_BIN:$PATH"
+          export OUT_DIR="$HOME/Bouquet_marble_out"
           ccache --max-size=2G
           ccache --zero-stats
           echo "clang: $(which clang) $(clang --version | head -1)"
-          ./build_bouquet.sh --defconfig "$DEFCONFIG" -- Image 2>&1 | tee build-base.log
+          ./build_bouquet.sh --defconfig "$DEFCONFIG" -- Image modules 2>&1 | tee build-base.log
 
-          # 不传 --ksu/--susfs 时上游一律把产物命名为 $OUT_DIR/Image，
-          # 后续两轮编译会覆盖它。这里立刻备份基础版并锁定 Image。
-          cp -f "$OUT_DIR/Image" "$OUT_DIR/Image.base"
+          # build_bouquet.sh 在未传 --ksu/--susfs 时把产物命名为 $OUT_DIR/Image。
+          # 先备份为上表中的 Image.base，再用内核树里的实际产物覆盖 Image，
+          # 保证后续两轮编译不会把它冲掉。
+          [ -f "$OUT_DIR/Image" ] && cp -f "$OUT_DIR/Image" "$OUT_DIR/Image.base" || true
           cp -f out/arch/arm64/boot/Image "$OUT_DIR/Image"
           cp -f out/vmlinux.symvers "$OUT_DIR/Image_vmlinux.symvers"
-          echo "基础版 Image 已锁定: $(ls -l "$OUT_DIR/Image" | awk '{print $5}') bytes"
+          echo "基础版 Image 已锁定: $(stat -c %s "$OUT_DIR/Image") bytes"
 
       - name: 编译 KernelSU 版本
         if: env.BUILD_KSU == 'true'
@@ -533,6 +539,7 @@ jobs:
         run: |
           set -euo pipefail
           export PATH="$LLVM_BIN:$PATH"
+          export OUT_DIR="$HOME/Bouquet_marble_out"
 
           # KernelSU 必须在基础编译之后才接入：drivers/kernelsu/ 存在时
           # drivers/Makefile 的 obj-y 会把它编进内核，若在基础编译前接入，
@@ -558,7 +565,7 @@ jobs:
             echo "CONFIG_KSU=y" >> "arch/arm64/configs/$DEFCONFIG"
           fi
 
-          ./build_bouquet.sh --noclean --defconfig "$DEFCONFIG" -- Image 2>&1 | tee build-ksu.log
+          ./build_bouquet.sh --noclean --defconfig "$DEFCONFIG" -- Image modules 2>&1 | tee build-ksu.log
 
           grep -q '^CONFIG_KSU=y$' out/.config || { echo "::error::CONFIG_KSU 未能生效"; exit 1; }
           # 把产物另存为 Image_ksu（上游脚本只在 with_ksu 时才这么命名）
@@ -577,6 +584,7 @@ jobs:
         run: |
           set -euo pipefail
           export PATH="$LLVM_BIN:$PATH"
+          export OUT_DIR="$HOME/Bouquet_marble_out"
 
           # SUSFS 必须在整树重编前打入：50_add 会改 fs/exec.c 等核心文件。
           bash "$GITHUB_WORKSPACE/scripts/marble_features/ksu_variant.sh" \
@@ -618,7 +626,7 @@ jobs:
           done
           unset _c
 
-          ./build_bouquet.sh --defconfig "$DEFCONFIG" -- Image 2>&1 | tee build-susfs.log
+          ./build_bouquet.sh --defconfig "$DEFCONFIG" -- Image modules 2>&1 | tee build-susfs.log
           cp -f out/arch/arm64/boot/Image "$OUT_DIR/Image_susfs"
           cp -f out/vmlinux.symvers "$OUT_DIR/Image_susfs_vmlinux.symvers"
 
@@ -671,6 +679,7 @@ jobs:
       - name: 汇总产物
         run: |
           set -euo pipefail
+          export OUT_DIR="$HOME/Bouquet_marble_out"
           echo "=== 上游输出目录 ==="
           ls -lh "$OUT_DIR" || true
           find "$OUT_DIR" -maxdepth 2 -type d | head -20
