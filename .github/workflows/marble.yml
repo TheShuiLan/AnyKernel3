@@ -518,6 +518,30 @@ jobs:
             echo "  [提示] 源码树无 mi_cnss_statistic 驱动，跳过补入"
           fi
 
+      - name: 关闭 LLVM Polly（工具链不支持）
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          # Slim LLVM 23.1.6 未启用 Polly。melt-rebase 的 arch/Kconfig 里
+          # LLVM_POLLY 带 `depends on $(cc-option, -mllvm -polly)` 探测，
+          # 不支持时该符号不可见，defconfig 里的 =y 会被 olddefconfig 丢弃。
+          #
+          # 但 melt-rebase-hyperos 的 arch/Kconfig 少了这一行 depends，
+          # 于是 =y 生效，Makefile 把 -mllvm -polly 等参数传给 clang：
+          #   clang (LLVM option parsing): Unknown command line argument '-polly'
+          #   make[2]: *** [scripts/Makefile.build:279: scripts/mod/empty.o] Error 1
+          # 编译在 prepare0 阶段就中断（约 10 秒），连内核都编不到。
+          #
+          # 因此在编译前把该配置显式关掉，两种分支都安全。
+          for dc in "arch/arm64/configs/$DEFCONFIG"; do
+            [ -f "$dc" ] || continue
+            if grep -qE '^CONFIG_LLVM_POLLY=' "$dc"; then
+              sed -i 's|^CONFIG_LLVM_POLLY=.*|# CONFIG_LLVM_POLLY is not set|' "$dc"
+              echo "已关闭 CONFIG_LLVM_POLLY（$dc）"
+            fi
+          done
+          grep -n "LLVM_POLLY" "arch/arm64/configs/$DEFCONFIG" || echo "defconfig 中无 LLVM_POLLY 条目"
+
       - name: 应用自定义版本后缀
         if: inputs.version_suffix != ''
         working-directory: kernel
