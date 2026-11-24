@@ -371,32 +371,67 @@ jobs:
           if [ -f build_bouquet.sh ] && [ -f build-tools/merge_dtbs.py ]; then
             echo "源码分支已自带构建脚本与 build-tools"
             chmod +x build_bouquet.sh build-tools/*
-            exit 0
+          else
+            echo "源码分支缺构建脚本，从 ${BB_BRANCH} 取"
+            # 用 blob:none 部分克隆 + cat-file 单文件提取。
+            # 不检出工作树：上游树里有 aux.c 等 Windows 保留名，
+            # checkout 在部分环境会直接报 invalid path；cat-file 不受影响。
+            TMP=$(mktemp -d)
+            trap 'rm -rf "$TMP"' EXIT
+            git init -q "$TMP"
+            git -C "$TMP" remote add origin "$BB_REPO"
+            git -C "$TMP" fetch --depth=1 --no-tags origin "$BB_BRANCH"
+            REF=$(git -C "$TMP" rev-parse FETCH_HEAD)
+            echo "脚本分支 ${BB_BRANCH} -> ${REF}"
+
+            git -C "$TMP" cat-file -p "${REF}:build_bouquet.sh" > build_bouquet.sh
+            rm -rf build-tools
+            mkdir -p build-tools
+            for t in avbtool fdtget fdtoverlay fdtoverlaymerge fdtput \
+                     merge_dtbs.py mkdtboimg.py ufdt_apply_overlay; do
+              git -C "$TMP" cat-file -p "${REF}:build-tools/$t" > "build-tools/$t"
+            done
+            chmod +x build_bouquet.sh build-tools/*
+            echo "已安装："
+            wc -l build_bouquet.sh
+            ls -l build-tools
           fi
 
-          echo "源码分支缺构建脚本，从 ${BB_BRANCH} 取"
-          # 用 blob:none 部分克隆 + cat-file 单文件提取。
-          # 不检出工作树：上游树里有 aux.c 等 Windows 保留名，
-          # checkout 在部分环境会直接报 invalid path；cat-file 不受影响。
-          TMP=$(mktemp -d)
-          trap 'rm -rf "$TMP"' EXIT
-          git init -q "$TMP"
-          git -C "$TMP" remote add origin "$BB_REPO"
-          git -C "$TMP" fetch --depth=1 --no-tags origin "$BB_BRANCH"
-          REF=$(git -C "$TMP" rev-parse FETCH_HEAD)
-          echo "脚本分支 ${BB_BRANCH} -> ${REF}"
-
-          git -C "$TMP" cat-file -p "${REF}:build_bouquet.sh" > build_bouquet.sh
-          rm -rf build-tools
-          mkdir -p build-tools
-          for t in avbtool fdtget fdtoverlay fdtoverlaymerge fdtput \
-                   merge_dtbs.py mkdtboimg.py ufdt_apply_overlay; do
-            git -C "$TMP" cat-file -p "${REF}:build-tools/$t" > "build-tools/$t"
+          # 修正模块收集路径。
+          # build_bouquet.sh 的 both_need_modules 清单是按另一套驱动目录写的，
+          # melt-rebase 上这两个触摸屏模块换了位置：
+          #   goodix_berlin_driver/goodix_core.ko -> goodix_9916r/goodix_core.ko
+          #   xiaomi_los/xiaomi_touch.ko          -> xiaomi/xiaomi_touch.ko
+          # 路径不匹配会让 strip_kmod 静默跳过（只打印 not found），
+          # 这两个模块因此既不进 vendor_boot_modules 也不进 vendor_dlkm_modules，
+          # 随后 make_package.py 的模块加载模拟因清单里缺文件而失败。
+          #
+          # 做法：按“文件名在源码树中的实际位置”重写清单行，幂等且不依赖目录名。
+          echo "=== 校正模块收集路径 ==="
+          for pair in \
+            "goodix_core.ko:drivers/input/touchscreen" \
+            "xiaomi_touch.ko:drivers/input/touchscreen"; do
+            _ko="${pair%%:*}"
+            _base="${pair##*:}"
+            _real=$(find "$_base" -type f -name "$_ko" 2>/dev/null | head -1)
+            if [ -z "$_real" ]; then
+              echo "  [警告] 源码树中找不到 $_ko（可能该机型未包含此驱动）"
+              continue
+            fi
+            _want="${_real#./}"
+            if grep -qxF "$_want" build_bouquet.sh; then
+              echo "  $_ko 路径已正确: $_want"
+              continue
+            fi
+            # 找到清单里引用该文件名的那一行并整行替换
+            _old=$(grep -E "^drivers/.*/${_ko}\$" build_bouquet.sh | head -1)
+            if [ -n "$_old" ]; then
+              sed -i "s|^${_old}\$|${_want}|" build_bouquet.sh
+              echo "  $_ko: $_old -> $_want"
+            else
+              echo "  [警告] 清单中没有 $_ko 条目，跳过（不影响，模板清单可能已更新）"
+            fi
           done
-          chmod +x build_bouquet.sh build-tools/*
-          echo "已安装：" 
-          wc -l build_bouquet.sh
-          ls -l build-tools
 
       - name: 应用自定义版本后缀
         if: inputs.version_suffix != ''
