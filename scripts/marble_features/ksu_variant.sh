@@ -1,0 +1,235 @@
+#!/usr/bin/env bash
+# ================================================================
+# marble 内核 KernelSU 变体集成
+#
+# 替代 build_bouquet.sh 的 --ksu / --susfs 选项。上游脚本硬编码
+# tiann/KernelSU 并一律应用已废弃的 10_enable_susfs_for_ksu.patch
+# （该补丁面向上游 KernelSU 手动钩子模型，SukiSU-Nova/BakaSU/FinaSU
+# 三者均已树内原生集成 SUSFS，驱动侧再打会导致 vmlinux 链接失败）。
+#
+# 本脚本按变体分派：
+#   tiann        : 上游 KernelSU + 50_add + 10_enable（唯一需要 10_enable 的）
+#   bakasu       : BakaSU 内建 SUSFS，只打 50_add
+#   sukisu-nova  : SukiSU-Nova builtin 分支，内建 SUSFS，只打 50_add
+#   finasu       : FinaSU 树内原生 SUSFS，只打 50_add；额外注入管理器证书
+#
+# 布局对齐 build_bouquet.sh：
+#   drivers/kernelsu/{.git,kernel,uapi}
+#   drivers/Kconfig / drivers/Makefile 接线
+# ================================================================
+set -uo pipefail
+
+KROOT=""
+VARIANT="tiann"
+WITH_SUSFS="false"
+KVER="5.10"
+AVER="android12"
+KSU_COMMIT=""
+KSU_CERT_SIZE=""
+KSU_CERT_HASH=""
+SKIP_INCOMPATIBLE="true"
+PATCHES_ROOT="${GITHUB_WORKSPACE:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --kernel-root)    KROOT="$2"; shift 2 ;;
+    --variant)        VARIANT="$2"; shift 2 ;;
+    --with-susfs)     WITH_SUSFS="$2"; shift 2 ;;
+    --kernel-version) KVER="$2"; shift 2 ;;
+    --android-version) AVER="$2"; shift 2 ;;
+    --ksu-commit)     KSU_COMMIT="$2"; shift 2 ;;
+    --cert-size)      KSU_CERT_SIZE="$2"; shift 2 ;;
+    --cert-hash)      KSU_CERT_HASH="$2"; shift 2 ;;
+    --skip-incompatible) SKIP_INCOMPATIBLE="$2"; shift 2 ;;
+    --patches-root)   PATCHES_ROOT="$2"; shift 2 ;;
+    -h|--help) sed -n '2,24p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    *) echo "未知参数: $1" >&2; exit 2 ;;
+  esac
+done
+
+[ -n "$KROOT" ] || { echo "--kernel-root 必填" >&2; exit 2; }
+[ -d "$KROOT" ] || { echo "内核树不存在: $KROOT" >&2; exit 2; }
+
+def_fail() {
+  local msg="$1"
+  if [ "$SKIP_INCOMPATIBLE" = "true" ]; then
+    echo "::warning title=KernelSU 已跳过::${msg}（构建未中断）"
+    if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+      echo "" >> "$GITHUB_STEP_SUMMARY"
+      echo "> ⏭️ **KernelSU(${VARIANT})** 已自动跳过：${msg}（构建未中断）" >> "$GITHUB_STEP_SUMMARY"
+    fi
+    exit 0
+  fi
+  echo "::error::KernelSU(${VARIANT}): ${msg}" >&2
+  exit 1
+}
+
+# ---- 1. 按变体确定仓库与分支 ----
+case "$VARIANT" in
+  tiann)
+    KSU_URL="https://github.com/tiann/KernelSU.git"
+    KSU_REF="main"
+    NEED_10_ENABLE=1
+    HAS_BUILTIN_SUSFS=0
+    ;;
+  bakasu)
+    KSU_URL="https://github.com/Baka-SU/BakaSU.git"
+    KSU_REF="main"
+    NEED_10_ENABLE=0
+    HAS_BUILTIN_SUSFS=1
+    ;;
+  sukisu-nova)
+    KSU_URL="https://git.zako.shirkneko.top:20004/shirkneko/SukiSU.git"
+    KSU_REF="builtin"
+    NEED_10_ENABLE=0
+    HAS_BUILTIN_SUSFS=1
+    ;;
+  finasu)
+    KSU_URL="https://github.com/LyraVoid/FinaSU.git"
+    KSU_REF="master"
+    NEED_10_ENABLE=0
+    HAS_BUILTIN_SUSFS=1
+    ;;
+  *)
+    echo "未知变体: $VARIANT（可选 tiann/bakasu/sukisu-nova/finasu）" >&2
+    exit 2
+    ;;
+esac
+
+echo "=== KernelSU 变体集成: $VARIANT (ref=$KSU_REF) ==="
+
+# ---- 2. 克隆 KernelSU ----
+KSU_DIR="$KROOT/../KernelSU"
+rm -rf "$KSU_DIR"
+if ! git clone --depth=1 -b "$KSU_REF" "$KSU_URL" "$KSU_DIR" 2>/dev/null; then
+  echo "  分支 $KSU_REF 克隆失败，回退到默认分支"
+  if ! git clone --depth=1 "$KSU_URL" "$KSU_DIR"; then
+    def_fail "克隆 $KSU_URL 失败"
+  fi
+fi
+
+# 可选：检出指定提交（版本对齐用）
+if [ -n "$KSU_COMMIT" ]; then
+  if ! git -C "$KSU_DIR" fetch --depth=1 origin "$KSU_COMMIT" 2>/dev/null; then
+    echo "  提交 $KSU_COMMIT 已在本地，跳过 fetch"
+  fi
+  if git -C "$KSU_DIR" checkout --detach "$KSU_COMMIT" 2>/dev/null; then
+    echo "  KernelSU 已检出到 $KSU_COMMIT"
+  else
+    def_fail "检出提交 $KSU_COMMIT 失败"
+  fi
+fi
+
+echo "  KSU commit: $(git -C "$KSU_DIR" rev-parse --short HEAD)"
+[ -d "$KSU_DIR/kernel" ] || def_fail "KernelSU 仓库缺少 kernel/ 目录"
+
+# ---- 3. 按 build_bouquet.sh 的布局接入 drivers/kernelsu ----
+rm -rf "$KROOT/drivers/kernelsu"
+mkdir -p "$KROOT/drivers/kernelsu"
+ln -s "$KSU_DIR/.git" "$KROOT/drivers/kernelsu/.git"
+cp -r "$KSU_DIR/kernel" "$KROOT/drivers/kernelsu/kernel"
+[ -d "$KSU_DIR/uapi" ] && cp -r "$KSU_DIR/uapi" "$KROOT/drivers/kernelsu/uapi"
+
+# 接线（幂等）
+# 锚点优先用 drivers/most/Kconfig（build_bouquet.sh 的原写法，
+# marble melt-rebase 的 drivers/Kconfig:239 存在该行）；
+# 缺失时退到该 menu 的 endmenu 前插入，避免静默漏接。
+if ! grep -qF 'source "drivers/kernelsu/kernel/Kconfig"' "$KROOT/drivers/Kconfig"; then
+  if grep -qF 'source "drivers/most/Kconfig"' "$KROOT/drivers/Kconfig"; then
+    sed -i '/source "drivers\/most\/Kconfig"/a source "drivers/kernelsu/kernel/Kconfig"' "$KROOT/drivers/Kconfig"
+  else
+    sed -i '/^endmenu$/i source "drivers/kernelsu/kernel/Kconfig"' "$KROOT/drivers/Kconfig"
+    echo "  [警告] drivers/Kconfig 无 most/Kconfig 锚点，改在 endmenu 前插入"
+  fi
+fi
+grep -qF 'source "drivers/kernelsu/kernel/Kconfig"' "$KROOT/drivers/Kconfig" \
+  || def_fail "drivers/Kconfig 接线失败"
+grep -qF 'obj-y += kernelsu/kernel/' "$KROOT/drivers/Makefile" \
+  || echo 'obj-y += kernelsu/kernel/' >> "$KROOT/drivers/Makefile"
+
+# ---- 4. FinaSU 管理器证书注入（第二信任槽） ----
+if [ "$VARIANT" = "finasu" ]; then
+  KBUILD="$KROOT/drivers/kernelsu/kernel/Kbuild"
+  if [ -n "$KSU_CERT_SIZE" ] && [ -n "$KSU_CERT_HASH" ]; then
+    if grep -q '^KSU_EXPECTED_SIZE2 := ' "$KBUILD" 2>/dev/null; then
+      echo "  FinaSU 证书槽已存在，跳过注入"
+    elif grep -q '^ccflags-y += -DEXPECTED_HASH=' "$KBUILD"; then
+      awk -v size="$KSU_CERT_SIZE" -v hash="$KSU_CERT_HASH" '
+        !done && /^ccflags-y \+= -DEXPECTED_HASH=/ {
+          print
+          print "# injected by marble: trust the official FinaSU manager via the second signature slot"
+          print "KSU_EXPECTED_SIZE2 := " size
+          print "KSU_EXPECTED_HASH2 := " hash
+          print "KSU_SECOND_SIGNATURE_RELEASE := 1"
+          done = 1
+          next
+        }
+        { print }
+      ' "$KBUILD" > "$KBUILD.new" && mv "$KBUILD.new" "$KBUILD"
+      grep -q '^KSU_EXPECTED_SIZE2 := ' "$KBUILD" || def_fail "FinaSU Kbuild 证书注入失败（锚点缺失）"
+      echo "  FinaSU 证书已注入: size=$KSU_CERT_SIZE"
+    else
+      echo "  [警告] FinaSU Kbuild 缺少 EXPECTED_HASH 锚点，跳过证书注入（管理器可能无法被识别）"
+    fi
+  else
+    echo "  [警告] 未提供 FinaSU 证书参数，跳过注入（官方管理器可能显示未安装）"
+  fi
+fi
+
+# ---- 5. SUSFS ----
+if [ "$WITH_SUSFS" = "true" ]; then
+  SUSFS_PATCH="50_add_susfs_in_gki-${AVER}-${KVER}.patch"
+  echo "=== SUSFS 集成（补丁: $SUSFS_PATCH） ==="
+
+  SUSFS_DIR=/tmp/marble_susfs4ksu
+  if [ ! -d "$SUSFS_DIR" ]; then
+    if ! git clone --depth=1 -b "gki-${AVER}-${KVER}" \
+         https://gitlab.com/simonpunk/susfs4ksu.git "$SUSFS_DIR"; then
+      rm -rf "$SUSFS_DIR"
+      def_fail "SUSFS 仓库克隆失败（无 gki-${AVER}-${KVER} 分支）"
+    fi
+  fi
+
+  [ -f "$SUSFS_DIR/kernel_patches/$SUSFS_PATCH" ] \
+    || def_fail "SUSFS 补丁不存在: $SUSFS_PATCH"
+
+  cp "$SUSFS_DIR"/kernel_patches/fs/* "$KROOT/fs/"
+  cp "$SUSFS_DIR"/kernel_patches/include/linux/* "$KROOT/include/linux/"
+
+  prev="$PWD"
+  cd "$KROOT" || def_fail "无法进入内核树"
+
+  # 主补丁
+  if patch -p1 --forward --dry-run < "$SUSFS_DIR/kernel_patches/$SUSFS_PATCH" >/dev/null 2>&1; then
+    patch -p1 --forward --no-backup-if-mismatch < "$SUSFS_DIR/kernel_patches/$SUSFS_PATCH" || true
+    echo "  50_add 主补丁已应用"
+  elif grep -q 'susfs_init' fs/susfs.c 2>/dev/null; then
+    echo "  50_add 主补丁此前已应用"
+  else
+    cd "$prev"
+    def_fail "SUSFS 50_add 主补丁应用失败"
+  fi
+
+  # 驱动侧：仅上游 tiann 需要 10_enable（路径需重写到 drivers/kernelsu/kernel/）
+  if [ "$NEED_10_ENABLE" = "1" ]; then
+    EN10="$SUSFS_DIR/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch"
+    if [ -f "$EN10" ]; then
+      sed -e 's|a/kernel/|a/drivers/kernelsu/kernel/|g' \
+          -e 's|b/kernel/|b/drivers/kernelsu/kernel/|g' \
+          "$EN10" > /tmp/10_enable_rewritten.patch
+      if patch -p1 --forward --no-backup-if-mismatch < /tmp/10_enable_rewritten.patch >/dev/null 2>&1; then
+        echo "  10_enable 驱动侧补丁已应用（tiann）"
+      else
+        echo "  [警告] 10_enable 应用失败，tiann 变体的 SUSFS 钩子可能不完整"
+      fi
+    else
+      echo "  [警告] 缺少 $EN10"
+    fi
+  else
+    echo "  $VARIANT 树内原生集成 SUSFS，跳过 10_enable（与 susfs_fixes/apply.sh 一致）"
+  fi
+
+  cd "$prev"
+fi
+
+echo "=== KernelSU 集成完成: $VARIANT$( [ "$WITH_SUSFS" = "true" ] && echo ' + SUSFS' ) ==="
