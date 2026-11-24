@@ -15,10 +15,15 @@
 #   - SUSFS:    susfs4ksu gki-android12-5.10
 #
 # 与 main.yml（GKI 通用构建）是两套独立流程，互不影响。
-# main.yml 的功能开关（BBG / 网络增强 / Re-Kernel / NoMount /
-# ZRAM 补丁栈 / CVE 修补 / Droidspaces）依赖 GKI 的
-# gki_defconfig、modules.bzl、kleaf 等结构，本设备树内核不适用，
-# 故此处不提供。详见 README-marble.md。
+#
+# 功能支持情况：
+#   ✅ CVE-2026-43499 rtmutex 修复链：5.10 在 apply_cve_2026_43499.sh
+#      的支持列表内（patch_chain_is_required 对 5.10 恒为 true）。
+#      marble 的 rtmutex.c 目录布局与 GKI 一致，脚本可直接以 kernel/
+#      为根运行；若内核已含修复，脚本会自动识别并跳过。
+#   ❌ BBG / 网络增强 / Re-Kernel / NoMount / ZRAM 补丁栈 /
+#      Droidspaces：依赖 GKI 的 gki_defconfig、modules.bzl、kleaf
+#      等结构，本设备树内核不适用。
 # ========================================
 
 name: 构建 Melt 内核
@@ -79,6 +84,18 @@ on:
       build_with_susfs:
         description: "额外构建 KernelSU + SUSFS 版本"
         required: true
+        type: boolean
+        default: true
+
+      # ==================== 安全补丁 ====================
+      cve_2026_43499_patch:
+        description: "应用 CVE-2026-43499 rtmutex 修复链（内核已含则自动跳过）"
+        required: true
+        type: boolean
+        default: true
+      skip_incompatible:
+        description: "补丁不适用时自动跳过（不中断构建）"
+        required: false
         type: boolean
         default: true
 
@@ -200,6 +217,39 @@ jobs:
           sed -i 's|export LOCALVERSION=-$(git rev-parse --short HEAD)|export LOCALVERSION=-$(git rev-parse --short HEAD)${{ inputs.version_suffix }}|' \
             build_bouquet.sh
           grep -n 'export LOCALVERSION=-$(git rev-parse' build_bouquet.sh
+
+      - name: 自动应用 CVE-2026-43499 rtmutex 修复链
+        if: inputs.cve_2026_43499_patch
+        working-directory: kernel
+        env:
+          SKIP_INCOMPATIBLE: ${{ inputs.skip_incompatible }}
+        run: |
+          set -euo pipefail
+          # 脚本以当前目录为内核树根，使用 kernel/locking/rtmutex.c 等相对路径。
+          # marble 是设备树内核，内核树根就是 kernel/，与 GKI 的
+          # KERNEL_ROOT/common 等价，目录结构一致。
+          if [ ! -f kernel/locking/rtmutex.c ]; then
+            echo "::error::未找到 kernel/locking/rtmutex.c，当前目录不是内核树根"
+            exit 1
+          fi
+
+          # 从 Makefile 取实际 SUBLEVEL（5.10 下 patch_chain_is_required 恒为 true，
+          # 但仍需合法数字，否则脚本以 exit 2 退出）
+          SUBLEVEL=$(grep '^SUBLEVEL = ' Makefile | awk '{print $3}')
+          echo "内核 SUBLEVEL=$SUBLEVEL"
+
+          if bash "$GITHUB_WORKSPACE/security_patch/apply_cve_2026_43499.sh" \
+              5.10 "$SUBLEVEL" "$GITHUB_WORKSPACE/security_patch"; then
+            echo "CVE-2026-43499 处理完成"
+          else
+            if [ "$SKIP_INCOMPATIBLE" = "true" ]; then
+              echo "::warning title=CVE-2026-43499 已跳过::补丁不适用，已跳过（构建未中断）"
+              echo "> ⏭️ **CVE-2026-43499** 已自动跳过：补丁不适用" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "::error::CVE-2026-43499 修复链应用失败"
+              exit 1
+            fi
+          fi
 
       - name: 准备构建脚本
         working-directory: kernel
