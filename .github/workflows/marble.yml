@@ -50,6 +50,11 @@ on:
         required: false
         type: string
         default: "melt-rebase"
+      build_script_branch:
+        description: "build_bouquet.sh 所在分支（该脚本仅存在于 bouquet_ci）"
+        required: false
+        type: string
+        default: "bouquet_ci"
       kernel_commit:
         description: "指定提交（留空=分支 HEAD）"
         required: false
@@ -200,6 +205,43 @@ jobs:
           echo "KERNEL_SHORT=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
           echo "BUILD_DATE=$(date -u '+%Y%m%d')" >> $GITHUB_ENV
 
+      - name: 安装构建脚本与 build-tools
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          BB_REPO="https://github.com/Pzqqt/android_kernel_xiaomi_marble.git"
+          BB_BRANCH="${{ inputs.build_script_branch }}"
+
+          if [ -f build_bouquet.sh ] && [ -f build-tools/merge_dtbs.py ]; then
+            echo "源码分支已自带构建脚本与 build-tools"
+            chmod +x build_bouquet.sh build-tools/*
+            exit 0
+          fi
+
+          echo "源码分支缺构建脚本，从 ${BB_BRANCH} 取"
+          # 用 blob:none 部分克隆 + cat-file 单文件提取。
+          # 不检出工作树：上游树里有 aux.c 等 Windows 保留名，
+          # checkout 在部分环境会直接报 invalid path；cat-file 不受影响。
+          TMP=$(mktemp -d)
+          trap 'rm -rf "$TMP"' EXIT
+          git init -q "$TMP"
+          git -C "$TMP" remote add origin "$BB_REPO"
+          git -C "$TMP" fetch --depth=1 --no-tags origin "$BB_BRANCH"
+          REF=$(git -C "$TMP" rev-parse FETCH_HEAD)
+          echo "脚本分支 ${BB_BRANCH} -> ${REF}"
+
+          git -C "$TMP" cat-file -p "${REF}:build_bouquet.sh" > build_bouquet.sh
+          rm -rf build-tools
+          mkdir -p build-tools
+          for t in avbtool fdtget fdtoverlay fdtoverlaymerge fdtput \
+                   merge_dtbs.py mkdtboimg.py ufdt_apply_overlay; do
+            git -C "$TMP" cat-file -p "${REF}:build-tools/$t" > "build-tools/$t"
+          done
+          chmod +x build_bouquet.sh build-tools/*
+          echo "已安装：" 
+          wc -l build_bouquet.sh
+          ls -l build-tools
+
       - name: 应用自定义版本后缀
         if: inputs.version_suffix != ''
         working-directory: kernel
@@ -251,16 +293,47 @@ jobs:
             fi
           fi
 
-      - name: 准备构建脚本
+      - name: 校验构建脚本
         working-directory: kernel
         run: |
           set -euo pipefail
+          # 脚本与 build-tools 已由前面步骤就位，这里只做完整性校验。
           if [ ! -f build_bouquet.sh ]; then
-            echo "::error::上游缺少 build_bouquet.sh，无法按官方方式构建"
+            echo "::error::build_bouquet.sh 缺失"
             exit 1
           fi
-          chmod +x build_bouquet.sh
-          ./build_bouquet.sh --help 2>&1 | head -30 || true
+
+          # build_bouquet.sh 依赖 build-tools/ 里的 dtb 合并与 dtbo 签名工具，
+          # 缺任何一个，后面 dtb/dtbo 生成阶段都会失败。
+          MISSING=""
+          for t in merge_dtbs.py mkdtboimg.py avbtool fdtput fdtget \
+                   fdtoverlay fdtoverlaymerge ufdt_apply_overlay; do
+            if [ ! -f "build-tools/$t" ]; then
+              MISSING="$MISSING $t"
+            fi
+          done
+          if [ -n "$MISSING" ]; then
+            echo "::error::build-tools 缺少:$MISSING"
+            ls -l build-tools 2>/dev/null || true
+            exit 1
+          fi
+          chmod +x build_bouquet.sh build-tools/*
+
+          echo "=== build_bouquet.sh ==="
+          wc -l build_bouquet.sh
+          grep -n '^DEFCONFIG=' build_bouquet.sh
+          echo "=== build-tools ==="
+          ls -l build-tools
+
+          # 脚本内写死的工具链路径必须与下载的版本一致，否则编译找不到 clang
+          EXPECT="llvm-${SLIM_LLVM}-x86_64"
+          if ! grep -q "$EXPECT" build_bouquet.sh; then
+            echo "::error::build_bouquet.sh 期望的工具链与所选版本不一致"
+            grep -n 'CLANG_PATH=' build_bouquet.sh
+            echo "所选版本：$SLIM_LLVM（期望路径含 $EXPECT）"
+            exit 1
+          fi
+          echo "工具链版本校验通过：$EXPECT"
 
       - name: 编译基础内核
         working-directory: kernel

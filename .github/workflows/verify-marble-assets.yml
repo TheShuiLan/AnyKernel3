@@ -1,0 +1,111 @@
+name: 验证 marble 构建资源
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/verify-marble-assets.yml"
+      - ".github/workflows/marble.yml"
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: 环境信息
+        run: |
+          set -euo pipefail
+          uname -a
+          git --version
+          python3 --version
+
+      - name: 拉取 bouquet_ci 的构建脚本与工具
+        run: |
+          set -euo pipefail
+          BB_BRANCH="bouquet_ci"
+          TMP=$(mktemp -d)
+          git init -q "$TMP"
+          git -C "$TMP" remote add origin \
+            https://github.com/Pzqqt/android_kernel_xiaomi_marble.git
+          git -C "$TMP" fetch --depth=1 --no-tags origin "$BB_BRANCH"
+          REF=$(git -C "$TMP" rev-parse FETCH_HEAD)
+          echo "REF=$REF" >> "$GITHUB_ENV"
+
+          mkdir -p out/build-tools
+          git -C "$TMP" cat-file -p "${REF}:build_bouquet.sh" > out/build_bouquet.sh
+          for t in avbtool fdtget fdtoverlay fdtoverlaymerge fdtput \
+                   merge_dtbs.py mkdtboimg.py ufdt_apply_overlay; do
+            git -C "$TMP" cat-file -p "${REF}:build-tools/$t" > "out/build-tools/$t"
+          done
+          chmod +x out/build_bouquet.sh out/build-tools/*
+          ls -l out/build_bouquet.sh out/build-tools
+          rm -rf "$TMP"
+
+      - name: 校验二进制工具可执行
+        run: |
+          set -euo pipefail
+          cd out/build-tools
+          for b in avbtool fdtget fdtoverlay fdtoverlaymerge fdtput ufdt_apply_overlay; do
+            echo "--- $b"
+            file "$b" | sed 's/^/    /'
+            if ! ./"$b" --help >/dev/null 2>&1 && ! ./"$b" >/dev/null 2>&1; then
+              # 非零退出不一定是错误（无参数时多数工具都会报用法），
+              # 只有「无法执行」才是致命错误。
+              if ./"$b" 2>&1 | grep -qi "error while loading shared libraries\|cannot execute"; then
+                echo "::error::$b 无法在当前系统执行"
+                exit 1
+              fi
+            fi
+            echo "    OK"
+          done
+
+      - name: 校验 Python 脚本可运行
+        run: |
+          set -euo pipefail
+          python3 -c "import rich; print('rich', rich.__version__)" || \
+            python3 -m pip install --quiet rich
+          cd out/build-tools
+          echo "--- merge_dtbs.py"
+          python3 merge_dtbs.py --help
+          echo "--- mkdtboimg.py"
+          python3 mkdtboimg.py --help
+
+      - name: 校验 build_bouquet.sh 关键假设
+        run: |
+          set -euo pipefail
+          S=out/build_bouquet.sh
+          bash -n "$S"
+          echo "语法 OK"
+
+          for k in 'DEFCONFIG=' 'CLANG_PATH=' 'KDIR=' 'OUTPUT_DIR='; do
+            printf '%-14s ' "$k"
+            grep -m1 "^$k" "$S" || { echo "::error::缺少 $k"; exit 1; }
+          done
+
+          # 工具链路径必须是我们选的版本
+          EXPECT="llvm-23.1.6-x86_64"
+          grep -q "$EXPECT" "$S" || {
+            echo "::error::工具链路径与 $EXPECT 不符"
+            exit 1
+          }
+          echo "工具链路径校验通过：$EXPECT"
+
+          # 脚本会 cd 到自己所在目录，必须确认这个行为存在，
+          # 否则从 kernel/ 调用时 KDIR 会指错。
+          grep -q 'cd ${0%/\*}' "$S" || {
+            echo "::error::未找到 cd \${0%/*}，KDIR 计算前提不成立"
+            exit 1
+          }
+          echo "cd 行为校验通过"
+
+      - name: 汇总
+        run: |
+          {
+            echo "## marble 构建资源验证通过"
+            echo ""
+            echo "- 脚本分支：\`bouquet_ci\` @ \`${REF}\`"
+            echo "- \`build_bouquet.sh\` 与 8 个 \`build-tools\` 文件均可获取"
+            echo "- 二进制工具在 ubuntu-24.04 可执行"
+            echo "- Python 脚本依赖齐全"
+            echo "- 工具链路径假设成立（llvm-23.1.6-x86_64）"
+          } >> "$GITHUB_STEP_SUMMARY"
