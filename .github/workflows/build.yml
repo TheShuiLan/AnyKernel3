@@ -359,7 +359,39 @@ jobs:
           REMOTE_BRANCH=$(git ls-remote https://android.googlesource.com/kernel/common ${FORMATTED_BRANCH})
           DEFAULT_MANIFEST_PATH=.repo/manifests/default.xml
 
-          if grep -q deprecated <<< $REMOTE_BRANCH; then
+          # revision 语义：r1 = 跟随该月分支的最新提交（历史行为）；
+          # rN (N>1) = 把源码锁定到该月 ASB tag ${FORMATTED_BRANCH}_rN，
+          # 使内核源码与打包用的 gki-certified-boot 镜像一致（同一 REVISION）。
+          REVISION="${{ inputs.revision }}"
+          PIN_TAG=""
+          if [[ -n "$REVISION" && "$REVISION" != "r1" ]]; then
+            if ! [[ "$REVISION" =~ ^r[0-9]+$ ]]; then
+              echo "::error::revision 格式非法（应为 r1、r2 ...）: $REVISION"
+              exit 1
+            fi
+            PIN_TAG="${FORMATTED_BRANCH}_${REVISION}"
+            PIN_COMMIT=$(git ls-remote https://android.googlesource.com/kernel/common "refs/tags/${PIN_TAG}^{}" | awk '{ print $1 }')
+            if [[ -z "$PIN_COMMIT" ]]; then
+              echo "::error::上游不存在 tag ${PIN_TAG}，无法锁定源码"
+              exit 1
+            fi
+            echo "源码锁定到 ${PIN_TAG} (${PIN_COMMIT})"
+          fi
+
+          if [[ -n "$PIN_TAG" ]]; then
+            # 把 common 仓的 revision/upstream/dest-branch 全部指向 tag，
+            # 避免 repo sync 因 dest-branch 仍为分支而回退到分支 HEAD。
+            if grep -q 'name="kernel/common"' "$DEFAULT_MANIFEST_PATH"; then
+              sed -i "/name=\"kernel\/common\"/ s|revision=\"[^\"]*\"|revision=\"refs/tags/${PIN_TAG}\"|" "$DEFAULT_MANIFEST_PATH"
+              sed -i "/name=\"kernel\/common\"/ s|dest-branch=\"[^\"]*\"|dest-branch=\"refs/tags/${PIN_TAG}\"|" "$DEFAULT_MANIFEST_PATH"
+            else
+              echo "::error::manifest 中未找到 kernel/common 项目，无法锁定源码"
+              exit 1
+            fi
+            echo "manifest 已锁定:"
+            grep 'name="kernel/common"' "$DEFAULT_MANIFEST_PATH"
+            REMOTE_BRANCH="refs/tags/${PIN_TAG}"
+          elif grep -q deprecated <<< $REMOTE_BRANCH; then
             echo "检测到已弃用的分支: $FORMATTED_BRANCH"
             sed -i "s/\"${FORMATTED_BRANCH}\"/\"deprecated\/${FORMATTED_BRANCH}\"/g" $DEFAULT_MANIFEST_PATH
           elif [[ -z "$REMOTE_BRANCH" ]]; then
