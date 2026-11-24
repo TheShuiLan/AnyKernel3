@@ -2,11 +2,23 @@
 # Melt Kernel 构建（Redmi Note 12 Turbo / Poco F5）
 # ========================================
 # 上游: https://github.com/Pzqqt/android_kernel_xiaomi_marble
-# 分支: melt-rebase   内核版本: 5.10.274   设备代号: marble / marblein
+# 分支: melt-rebase   内核 5.10.x   设备: marble / marblein
 #
-# 与 main.yml 的差别：main.yml 走 GKI（repo + kleaf），本工作流是
-# 设备树（非 GKI），用 make + marble_defconfig + LLVM 工具链直接编译，
-# 产出 Image / dtb / dtbo，再打成 AnyKernel3 卡刷包。
+# 编译方式完全对齐上游作者本人的 CI（bouquet_ci 分支的
+# .github/workflows/build.yml + build_bouquet.sh）：
+#   - 工具链: Slim LLVM 23.1.6
+#     https://mirrors.edge.kernel.org/pub/tools/llvm/files/llvm-23.1.6-x86_64.tar.xz
+#   - make: ARCH=arm64 LLVM=1 LLVM_IAS=1 O=out
+#           KCFLAGS="-D__ANDROID_COMMON_KERNEL__ -O3"
+#           KBUILD_LDFLAGS="-O3 --lto-O3"
+#   - KernelSU: tiann/KernelSU（GKI 模式，非 setup.sh）
+#   - SUSFS:    susfs4ksu gki-android12-5.10
+#
+# 与 main.yml（GKI 通用构建）是两套独立流程，互不影响。
+# main.yml 的功能开关（BBG / 网络增强 / Re-Kernel / NoMount /
+# ZRAM 补丁栈 / CVE 修补 / Droidspaces）依赖 GKI 的
+# gki_defconfig、modules.bzl、kleaf 等结构，本设备树内核不适用，
+# 故此处不提供。详见 README-marble.md。
 # ========================================
 
 name: 构建 Melt 内核
@@ -22,7 +34,7 @@ permissions:
 on:
   workflow_dispatch:
     inputs:
-      # ==================== 源码配置 ====================
+      # ==================== 源码 ====================
       kernel_repo:
         description: "内核源码仓库"
         required: false
@@ -34,54 +46,43 @@ on:
         type: string
         default: "melt-rebase"
       kernel_commit:
-        description: "指定提交（留空=跟随分支 HEAD）"
+        description: "指定提交（留空=分支 HEAD）"
         required: false
         type: string
         default: ""
 
-      # ==================== 编译配置 ====================
+      # ==================== 编译 ====================
       defconfig:
-        description: "defconfig 名称（arch/arm64/configs/ 下）"
+        description: "defconfig"
         required: false
         type: string
         default: "marble_defconfig"
-      clang_version:
-        description: "Clang 版本"
+      slim_llvm_version:
+        description: "Slim LLVM 版本（上游 build_bouquet.sh 写死 23.1.6，改此项需确认上游脚本已更新）"
         required: false
         type: choice
         options:
-          - "clang-r416183b"
-          - "clang-r487747c"
-          - "clang-r510928"
-        default: "clang-r416183b"
-      extra_configs:
-        description: "追加 config（空格分隔，如 CONFIG_X=y CONFIG_Y=n）"
+          - "23.1.6"
+        default: "23.1.6"
+      version_suffix:
+        description: "自定义内核版本后缀（通过 LOCALVERSION 注入，与上游默认 -<sha> 合并）"
         required: false
         type: string
         default: ""
 
-      # ==================== KernelSU ====================
-      use_kernelsu:
-        description: "集成 KernelSU"
+      # ==================== KernelSU / SUSFS ====================
+      build_with_ksu:
+        description: "额外构建 KernelSU 版本（GKI 模式，tiann/KernelSU）"
         required: true
         type: boolean
-        default: false
-      kernelsu_variant:
-        description: "KernelSU 变体"
-        required: false
-        type: choice
-        options:
-          - "SukiSU-Nova"
-          - "BakaSU"
-          - "FinaSU"
-        default: "SukiSU-Nova"
-      kernelsu_branch:
-        description: "KernelSU setup.sh 使用的分支（main / builtin）"
-        required: false
-        type: string
-        default: "main"
+        default: true
+      build_with_susfs:
+        description: "额外构建 KernelSU + SUSFS 版本"
+        required: true
+        type: boolean
+        default: true
 
-      # ==================== 打包配置 ====================
+      # ==================== 发布 ====================
       release_type:
         description: "发布类型"
         required: true
@@ -91,27 +92,22 @@ on:
           - Pre-Release
           - Release
         default: Actions
-      artifact_upload_mode:
-        description: "产物上传模式"
-        required: true
-        type: choice
-        options:
-          - "仅上传 AnyKernel3.zip"
-          - "上传全部"
-        default: "仅上传 AnyKernel3.zip"
 
 env:
   KERNEL_REPO: ${{ inputs.kernel_repo }}
   KERNEL_BRANCH: ${{ inputs.kernel_branch }}
   DEFCONFIG: ${{ inputs.defconfig }}
-  CLANG_VERSION: ${{ inputs.clang_version }}
+  SLIM_LLVM: ${{ inputs.slim_llvm_version }}
+  # 上游脚本的产物目录
+  OUT_DIR: ${{ github.workspace }}/build_toolchain/Bouquet_marble_out
 
 jobs:
-  # ==================== 构建 ====================
   build-marble:
     name: "Melt ${{ inputs.kernel_branch }}"
     runs-on: ubuntu-24.04
     timeout-minutes: 360
+    env:
+      CCACHE_DIR: /home/runner/.ccache
 
     steps:
       - name: 构建信息摘要
@@ -121,13 +117,13 @@ jobs:
             echo ""
             echo "| 项目 | 值 |"
             echo "|:---|:---|"
-            echo "| 源码 | $KERNEL_REPO |"
-            echo "| 分支 | $KERNEL_BRANCH |"
-            echo "| 提交 | ${{ inputs.kernel_commit || 'HEAD' }} |"
-            echo "| defconfig | $DEFCONFIG |"
-            echo "| Clang | $CLANG_VERSION |"
-            echo "| KernelSU | ${{ inputs.use_kernelsu && inputs.kernelsu_variant || '未集成' }} |"
-            echo "| 运行 | [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |"
+            echo "| 源码 | \`$KERNEL_REPO\` |"
+            echo "| 分支 | \`$KERNEL_BRANCH\` |"
+            echo "| 提交 | \`${{ inputs.kernel_commit || 'HEAD' }}\` |"
+            echo "| defconfig | \`$DEFCONFIG\` |"
+            echo "| 工具链 | Slim LLVM $SLIM_LLVM |"
+            echo "| KernelSU | ${{ inputs.build_with_ksu }} |"
+            echo "| SUSFS | ${{ inputs.build_with_susfs }} |"
           } >> $GITHUB_STEP_SUMMARY
 
       - name: 清理磁盘空间
@@ -136,26 +132,43 @@ jobs:
             /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
           df -h /
 
-      - name: 检出本仓库
-        uses: actions/checkout@v7
+      - name: 缓存 Slim LLVM
+        id: llvm-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/build_toolchain/llvm-${{ inputs.slim_llvm_version }}-x86_64.tar.xz
+          key: llvm-${{ inputs.slim_llvm_version }}-x86_64
 
-      - name: 安装编译依赖
+      - name: 下载 Slim LLVM
+        if: steps.llvm-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p ~/build_toolchain
+          cd ~/build_toolchain
+          URL="https://mirrors.edge.kernel.org/pub/tools/llvm/files/llvm-${SLIM_LLVM}-x86_64.tar.xz"
+          echo "下载 $URL"
+          curl -L --retry 5 --retry-delay 5 -o "llvm-${SLIM_LLVM}-x86_64.tar.xz" "$URL"
+
+      - name: 解压工具链
+        run: |
+          set -euo pipefail
+          cd ~/build_toolchain
+          tar -xJf "llvm-${SLIM_LLVM}-x86_64.tar.xz"
+          ls -1
+          # 记录 bin 目录，供后续步骤加入 PATH
+          BIN_DIR=$(find ~/build_toolchain -maxdepth 2 -type d -name bin | head -1)
+          echo "LLVM_BIN=$BIN_DIR" >> $GITHUB_ENV
+          echo "工具链路径: $BIN_DIR"
+          "$BIN_DIR/clang" --version
+
+      - name: 安装依赖
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            bc bison build-essential ccache cpio curl flex git libelf-dev \
-            libssl-dev libncurses-dev lz4 python3 rsync unzip zip zstd
-
-      - name: 下载 Clang 工具链
-        run: |
-          set -euo pipefail
-          URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/${CLANG_VERSION}.tar.gz"
-          echo "下载 $CLANG_VERSION ..."
-          curl -L --retry 5 --retry-delay 5 -o clang.tar.gz "$URL"
-          mkdir -p "$GITHUB_WORKSPACE/toolchain"
-          tar -xzf clang.tar.gz -C "$GITHUB_WORKSPACE/toolchain"
-          rm -f clang.tar.gz
-          "$GITHUB_WORKSPACE/toolchain/bin/clang" --version
+            aria2 bc bison build-essential ccache cpio curl flex git \
+            libelf-dev libssl-dev libncurses-dev lz4 python3 python3-pip \
+            rsync unzip wget xz-utils zip zstd
+          sudo pip3 install --no-cache-dir rich
 
       - name: 克隆内核源码
         run: |
@@ -168,93 +181,81 @@ jobs:
           fi
           echo "KERNEL_SHA=$(git rev-parse HEAD)" >> $GITHUB_ENV
           echo "KERNEL_SHORT=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+          echo "BUILD_DATE=$(date -u '+%Y%m%d')" >> $GITHUB_ENV
 
-      - name: 配置 ccache
-        uses: actions/cache@v4
-        with:
-          path: ~/.ccache
-          key: ccache-${{ inputs.defconfig }}-${{ inputs.clang_version }}-${{ github.run_id }}
-          restore-keys: |
-            ccache-${{ inputs.defconfig }}-${{ inputs.clang_version }}-
-
-      - name: 配置编译器
-        run: |
-          echo "$GITHUB_WORKSPACE/toolchain/bin" >> $GITHUB_PATH
-          {
-            echo "CC=clang"
-            echo "CXX=clang++"
-            echo "AR=llvm-ar"
-            echo "NM=llvm-nm"
-            echo "OBJCOPY=llvm-objcopy"
-            echo "OBJDUMP=llvm-objdump"
-            echo "STRIP=llvm-strip"
-            echo "READELF=llvm-readelf"
-            echo "LLVM_IAS=1"
-          } >> $GITHUB_ENV
-
-      - name: 生成 defconfig
+      - name: 应用自定义版本后缀
+        if: inputs.version_suffix != ''
         working-directory: kernel
         run: |
           set -euo pipefail
-          make -j$(nproc --all) \
-            ARCH=arm64 LLVM=1 LLVM_IAS=1 \
-            O=out "$DEFCONFIG"
-
-          if [ -n "${{ inputs.extra_configs }}" ]; then
-            echo "追加 config: ${{ inputs.extra_configs }}"
-            cd out
-            for cfg in ${{ inputs.extra_configs }}; do
-              ./scripts/config --file .config $cfg
-            done
-            cd ..
-            make -j$(nproc --all) ARCH=arm64 LLVM=1 LLVM_IAS=1 O=out olddefconfig
+          # 上游 build_bouquet.sh 在 CI（USER=runner）下用
+          # export LOCALVERSION=-$(git rev-parse --short HEAD)
+          # 覆盖内核版本后缀，defconfig 里的 CONFIG_LOCALVERSION 会被覆盖。
+          # 因此这里改写脚本，把自定义后缀拼到它自己的 LOCALVERSION 后面。
+          if ! grep -q 'LOCALVERSION=-$(git rev-parse --short HEAD)' build_bouquet.sh; then
+            echo "::error::build_bouquet.sh 的 LOCALVERSION 逻辑与预期不符，请核对上游改动"
+            grep -n 'LOCALVERSION' build_bouquet.sh
+            exit 1
           fi
+          sed -i 's|export LOCALVERSION=-$(git rev-parse --short HEAD)|export LOCALVERSION=-$(git rev-parse --short HEAD)${{ inputs.version_suffix }}|' \
+            build_bouquet.sh
+          grep -n 'export LOCALVERSION=-$(git rev-parse' build_bouquet.sh
 
-          echo "=== 最终 KERNELRELEASE ==="
-          grep -E '^CONFIG_LOCALVERSION=' out/.config || true
-
-      - name: 集成 KernelSU
-        if: inputs.use_kernelsu
+      - name: 准备构建脚本
         working-directory: kernel
         run: |
           set -euo pipefail
-          case "${{ inputs.kernelsu_variant }}" in
-            "SukiSU-Nova")
-              # 该 Forgejo 实例对 /<owner>/<repo>.git 的 smart-HTTP 返回 401，
-              # 不带 .git 后缀才可匿名拉取
-              URL="https://git.zako.shirkneko.top:20004/shirkneko/SukiSU/raw/branch/main/kernel/setup.sh"
-              ;;
-            "BakaSU")
-              URL="https://raw.githubusercontent.com/Baka-SU/BakaSU/main/kernel/setup.sh"
-              ;;
-            "FinaSU")
-              URL="https://raw.githubusercontent.com/LyraVoid/FinaSU/master/kernel/setup.sh"
-              ;;
-            *)
-              echo "::error::未知变体: ${{ inputs.kernelsu_variant }}"
-              exit 1
-              ;;
-          esac
+          if [ ! -f build_bouquet.sh ]; then
+            echo "::error::上游缺少 build_bouquet.sh，无法按官方方式构建"
+            exit 1
+          fi
+          chmod +x build_bouquet.sh
+          ./build_bouquet.sh --help 2>&1 | head -30 || true
 
-          curl -LSs "$URL" | bash -s -- "${{ inputs.kernelsu_branch }}"
+      - name: 编译基础内核
+        working-directory: kernel
+        env:
+          BUILD_TOOLCHAIN: ${{ env.GITHUB_WORKSPACE }}/build_toolchain
+        run: |
+          set -euo pipefail
+          export PATH="$LLVM_BIN:$PATH"
+          ccache --max-size=2G
+          ccache --zero-stats
+          echo "clang: $(which clang) $(clang --version | head -1)"
+          ./build_bouquet.sh --defconfig "$DEFCONFIG" -- Image 2>&1 | tee build-base.log
 
-      - name: 编译内核
+      - name: 编译 KernelSU 版本
+        if: inputs.build_with_ksu
         working-directory: kernel
         run: |
           set -euo pipefail
-          make -j$(nproc --all) \
-            ARCH=arm64 LLVM=1 LLVM_IAS=1 \
-            O=out \
-            CC="ccache clang" \
-            Image.gz dtbo.img dtb.img 2>&1 | tee build.log
+          export PATH="$LLVM_BIN:$PATH"
+          if [ ! -d "$HOME/KernelSU" ]; then
+            git clone --depth=1 https://github.com/tiann/KernelSU.git "$HOME/KernelSU"
+          fi
+          ./build_bouquet.sh --noclean --ksu -- Image 2>&1 | tee build-ksu.log
+
+      - name: 编译 KernelSU + SUSFS 版本
+        if: inputs.build_with_susfs
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          export PATH="$LLVM_BIN:$PATH"
+          if [ ! -d "$HOME/KernelSU" ]; then
+            git clone --depth=1 https://github.com/tiann/KernelSU.git "$HOME/KernelSU"
+          fi
+          if [ ! -d "$HOME/susfs4ksu" ]; then
+            git clone --depth=1 -b gki-android12-5.10 \
+              https://gitlab.com/simonpunk/susfs4ksu.git "$HOME/susfs4ksu"
+          fi
+          ./build_bouquet.sh --susfs -- Image 2>&1 | tee build-susfs.log
 
       - name: 整理编译失败日志
         if: failure()
         run: |
           mkdir -p fail-logs
-          cp kernel/build.log fail-logs/ 2>/dev/null || true
+          cp kernel/build-*.log fail-logs/ 2>/dev/null || true
           cp kernel/out/.config fail-logs/ 2>/dev/null || true
-          tail -n 300 kernel/build.log > fail-logs/tail.txt 2>/dev/null || true
 
       - name: 上传编译失败日志
         if: failure()
@@ -264,116 +265,95 @@ jobs:
           path: fail-logs/*
           if-no-files-found: ignore
 
-      - name: 准备产物
+      - name: 安装打包依赖
         run: |
           set -euo pipefail
-          mkdir -p artifacts
-          OUT=kernel/out/arch/arm64/boot
+          # make_package.py 硬依赖 7za 与 hdiffz（脚本内有 shutil.which 断言）
+          sudo apt-get install -y --no-install-recommends p7zip-full
+          mkdir -p ~/.local/bin
+          cd /tmp
+          curl -L --retry 5 -o hd.zip \
+            https://github.com/sisong/HDiffPatch/releases/download/v4.12.2/hdiffpatch_v4.12.2_bin_linux64.zip
+          unzip -o -q hd.zip
+          cp linux64/hdiffz linux64/hpatchz ~/.local/bin/ 2>/dev/null || cp ./hdiffz ./hpatchz ~/.local/bin/
+          chmod +x ~/.local/bin/*
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+          (command -v 7za || command -v 7z) && ~/.local/bin/hdiffz --help 2>&1 | head -2 || true
 
-          # 内核镜像：优先 Image.gz，退回 Image
-          if [ -f "$OUT/Image.gz" ]; then
-            cp "$OUT/Image.gz" artifacts/Image.gz
-            echo "IMAGE=Image.gz" >> $GITHUB_ENV
-          elif [ -f "$OUT/Image" ]; then
-            cp "$OUT/Image" artifacts/Image
-            echo "IMAGE=Image" >> $GITHUB_ENV
-          else
-            echo "::error::未找到 Image / Image.gz"
-            ls -la "$OUT" || true
+      - name: 汇总产物
+        run: |
+          set -euo pipefail
+          echo "=== 上游输出目录 ==="
+          ls -lh "$OUT_DIR" || true
+          find "$OUT_DIR" -maxdepth 2 -type d | head -20
+
+          mkdir -p dist
+          cp "$OUT_DIR"/Image* dist/ 2>/dev/null || true
+          cp -r "$OUT_DIR"/devicetree dist/ 2>/dev/null || true
+          cp -r "$OUT_DIR"/alt_kernel_modules dist/ 2>/dev/null || true
+          cp -r "$OUT_DIR"/vendor_boot_modules dist/ 2>/dev/null || true
+          cp -r "$OUT_DIR"/vendor_dlkm_modules dist/ 2>/dev/null || true
+
+          echo "=== dist ==="
+          ls -lh dist
+          if [ -z "$(ls -A dist)" ]; then
+            echo "::error::未产出任何文件"
             exit 1
           fi
 
-          # dtb / dtbo：设备树可能合并成 dtb.img，也可能散装
-          for f in dtbo.img dtb.img; do
-            [ -f "$OUT/$f" ] && cp "$OUT/$f" artifacts/
-          done
-          if compgen -G "$OUT/dts/*/*.dtb" > /dev/null 2>&1; then
-            mkdir -p artifacts/dtb
-            find "$OUT/dts" -name '*.dtb' -exec cp {} artifacts/dtb/ \;
-          fi
-
-          ls -lh artifacts
-
-      - name: 创建 AnyKernel3 刷入包
+      - name: 打包 AnyKernel3
         run: |
           set -euo pipefail
-          # 用 osm0sis 官方原版模板（非 WildKernels 的 GKI 定制版）：
-          # marble 是设备树内核，需用 flash_boot 保留原 ramdisk 只替换内核；
-          # WildKernels 的 gki-2.0 模板含 GKI 硬编码检查与广告，不适用。
-          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git ak3
-          rm -rf ak3/.git ak3/README.md
+          # 用上游作者本人的 Marble-Melt 模板（含 _dtb / _modules_hyperos /
+          # vendor_boot_fix / bs_patches / make_package.py），
+          # 不要用 osm0sis 通用模板或 WildKernels 的 GKI 模板。
+          git clone --depth=1 -b Marble-Melt https://github.com/Pzqqt/AnyKernel3.git ak3
+          cd ak3
+          rm -f ./Image*
 
-          # 模板自带的示例 ramdisk/patch 内容用不到
-          rm -rf ak3/ramdisk ak3/patch ak3/modules
+          # 按上游 CI 的方式填充打包内容
+          [ -f ../dist/devicetree/ukee.dtb ] && cp -f ../dist/devicetree/ukee.dtb ./_dtb/dtb
+          [ -f ../dist/devicetree/dtbo.img ] && cp -f ../dist/devicetree/dtbo.img ./_dtb/dtbo.img
+          [ -d ../dist/alt_kernel_modules ] && cp -f ../dist/alt_kernel_modules/* ./_modules_hyperos/_alt/ 2>/dev/null || true
+          [ -d ../dist/vendor_boot_modules ] && cp -f ../dist/vendor_boot_modules/* ./_modules_hyperos/_vendor_boot_modules/ 2>/dev/null || true
+          [ -d ../dist/vendor_dlkm_modules ] && cp -f ../dist/vendor_dlkm_modules/* ./_modules_hyperos/_vendor_dlkm_modules/ 2>/dev/null || true
+          cp -f ../dist/Image* ./
 
-          cp "artifacts/$IMAGE" ak3/
-          [ -f artifacts/dtbo.img ] && cp artifacts/dtbo.img ak3/
-          [ -f artifacts/dtb.img ] && cp artifacts/dtb.img ak3/
+          ls -lh . | head -20
 
-          # 用 marble 的配置重写 anykernel.sh
-          cat > ak3/anykernel.sh <<'AK3EOF'
-          ### AnyKernel3 Ramdisk Mod Script
-          ## osm0sis @ xda-developers
+          # make_package.py 把 vmlinux.symvers 路径写死成作者的本地路径，
+          # 需改成实际路径，否则模块加载模拟必然失败
+          SYMVERS="$GITHUB_WORKSPACE/kernel/out/vmlinux.symvers"
+          sed -i "s|^VMLINUX_SYMVERS_FILE = .*|VMLINUX_SYMVERS_FILE = '${SYMVERS}'|" make_package.py
+          grep -n 'VMLINUX_SYMVERS_FILE =' make_package.py
 
-          properties() { '
-          kernel.string=Melt Kernel (marble)
-          do.devicecheck=1
-          do.modules=0
-          do.systemless=0
-          do.cleanup=1
-          do.cleanuponabort=0
-          device.name1=marble
-          device.name2=marblein
-          device.name3=
-          device.name4=
-          device.name5=
-          supported.versions=12,13
-          supported.patchlevels=
-          supported.vendorpatchlevels=
-          '; } # end properties
-
-          ## boot shell variables
-          BLOCK=boot
-          IS_SLOT_DEVICE=auto
-          RAMDISK_COMPRESSION=auto
-          PATCH_VBMETA_FLAG=auto
-
-          # import functions/variables and setup patching (DO NOT REMOVE)
-          . tools/ak3-core.sh
-
-          # marble 为设备树内核，用 flash_boot 保留原 ramdisk，只替换 kernel/dtb
-          split_boot
-          flash_boot
-          ## end boot install
-          AK3EOF
-
-          chmod +x ak3/anykernel.sh
-          bash -n ak3/anykernel.sh
-
-          ZIP_NAME="Melt-${KERNEL_SHORT}-${DEFCONFIG%-defconfig}"
-          if [ "${{ inputs.use_kernelsu }}" = "true" ]; then
-            ZIP_NAME="${ZIP_NAME}-KSU"
+          # main_multi 强制 assert Image 与 Image_ksu 同时存在；
+          # 未构建 KSU 时（或 KSU 构建失败）用基础 Image 占位，
+          # 使打包流程仍能跑通。
+          if [ ! -f Image_ksu ]; then
+            echo "::warning::Image_ksu 不存在（未启用或构建失败），用 Image 占位"
+            cp -f Image Image_ksu
           fi
 
-          (cd ak3 && zip -r -q -9 "../${ZIP_NAME}-AnyKernel3.zip" .)
-          echo "ZIP_NAME=$ZIP_NAME" >> $GITHUB_ENV
-          ls -lh "${ZIP_NAME}-AnyKernel3.zip"
+          echo "=== 调用 make_package.py ==="
+          python3 ./make_package.py "ci-${BUILD_DATE}-${KERNEL_SHORT}"
 
-      - name: 整理产物目录
+      - name: 收集 zip
         run: |
           set -euo pipefail
           mkdir -p package
-          cp "${ZIP_NAME}-AnyKernel3.zip" package/
-          if [ "${{ inputs.artifact_upload_mode }}" = "上传全部" ]; then
-            cp artifacts/* package/ 2>/dev/null || true
-          fi
+          find . -maxdepth 2 -name '*.zip' -not -path './kernel/*' -exec cp {} package/ \;
           ls -lh package
+          if [ -z "$(ls -A package)" ]; then
+            echo "::error::未生成 zip"
+            exit 1
+          fi
 
       - name: 上传产物
         uses: actions/upload-artifact@v6
         with:
-          name: ${{ env.ZIP_NAME }}-AnyKernel3
-          path: package/*
+          name: Melt-marble-${{ env.KERNEL_SHORT }}
+          path: package/*.zip
           if-no-files-found: error
 
       - name: 构建摘要
@@ -384,10 +364,9 @@ jobs:
             echo "### 结果"
             echo ""
             echo "- 内核提交: \`${KERNEL_SHA:-unknown}\`"
-            echo "- 产物: \`${ZIP_NAME}-AnyKernel3.zip\`"
+            echo "- 工具链: Slim LLVM $SLIM_LLVM"
           } >> $GITHUB_STEP_SUMMARY
 
-  # ==================== 发布 ====================
   release:
     if: ${{ always() && !cancelled() && inputs.release_type != 'Actions' && needs.build-marble.result == 'success' }}
     needs: build-marble
@@ -407,11 +386,7 @@ jobs:
         run: |
           set -euo pipefail
           BASE="melt-$(date -u '+%Y%m%d')"
-          FULL_TAG=""
-          for i in 1 2 3; do
-            FULL_TAG=$(gh api "repos/$REPO_OWNER/$REPO_NAME/tags" --jq '.[0].name' 2>/dev/null) && [ -n "$FULL_TAG" ] && break
-            FULL_TAG=""; sleep 3
-          done
+          FULL_TAG=$(gh api "repos/$REPO_OWNER/$REPO_NAME/tags" --jq '.[0].name' 2>/dev/null || echo "")
           if [[ "$FULL_TAG" == "$BASE"-r* ]]; then
             R=$(echo "$FULL_TAG" | sed 's/.*-r//'); R=$((R + 1))
           else
@@ -428,10 +403,10 @@ jobs:
             --title "Melt Kernel $NEW_TAG" \
             --notes "Melt Kernel for Redmi Note 12 Turbo (marble) / Poco F5 (marblein)
 
-          - 源码: ${{ inputs.kernel_repo }} @ ${{ inputs.kernel_branch }}
-          - defconfig: ${{ inputs.defconfig }}
-          - Clang: ${{ inputs.clang_version }}
-          - KernelSU: ${{ inputs.use_kernelsu && inputs.kernelsu_variant || '未集成' }}
+          - 源码: \`${{ inputs.kernel_repo }}\` @ \`${{ inputs.kernel_branch }}\`
+          - defconfig: \`${{ inputs.defconfig }}\`
+          - 工具链: Slim LLVM ${{ inputs.slim_llvm_version }}
+          - 变体: 基础 / KernelSU / KernelSU+SUSFS
 
           > 刷入前请备份原厂 boot 镜像。" \
             --target "$GITHUB_SHA" $FLAGS
