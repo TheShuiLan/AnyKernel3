@@ -229,6 +229,15 @@ jobs:
           esac
           echo "构建变体: 基础=$BUILD_BASE KSU=$BUILD_KSU SUSFS=$BUILD_SUSFS"
 
+      # e652cd9 改用 Slim LLVM 时移除了 checkout，此后 workflow 一直无法
+      # 访问本仓库文件；security_patch/ 与 scripts/ 的引用全部落空
+      # （bash 报 exit 127）。CVE 步骤因 skip_incompatible 掩盖了该失败，
+      # 新增的功能补丁步骤没有同类兜底，直接中断。
+      - name: 检出本仓库（补丁脚本资源）
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
       - name: 清理磁盘空间
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android/sdk/ndk \
@@ -365,6 +374,27 @@ jobs:
           sed -i 's|export LOCALVERSION=-$(git rev-parse --short HEAD)|export LOCALVERSION=-$(git rev-parse --short HEAD)${{ inputs.version_suffix }}|' \
             build_bouquet.sh
           grep -n 'export LOCALVERSION=-$(git rev-parse' build_bouquet.sh
+
+      - name: 校验补丁脚本资源
+        run: |
+          # 这一步专门区分「资源缺失」（本仓库未检出/结构变动，属于致命错误）
+          # 与「补丁不适用」（内核版本不匹配，可跳过）。若不单独校验，
+          # 后续 bash 调用会以 exit 127 退出并被 skip_incompatible 误当作
+          # 「不适用」静默吞掉，掩盖真实问题。
+          MISSING=""
+          for f in \
+            security_patch/apply_cve_2026_43499.sh \
+            scripts/marble_features/apply.sh \
+            scripts/marble_features/ksu_variant.sh; do
+            [ -f "$GITHUB_WORKSPACE/$f" ] || MISSING="$MISSING $f"
+          done
+          if [ -n "$MISSING" ]; then
+            echo "::error::本仓库补丁资源缺失:$MISSING（检查 checkout 步骤是否存在）"
+            echo "GITHUB_WORKSPACE=$GITHUB_WORKSPACE"
+            ls -la "$GITHUB_WORKSPACE" 2>/dev/null || true
+            exit 1
+          fi
+          echo "补丁脚本资源校验通过"
 
       - name: 自动应用 CVE-2026-43499 rtmutex 修复链
         if: inputs.cve_2026_43499_patch
