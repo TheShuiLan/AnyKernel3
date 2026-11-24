@@ -511,6 +511,41 @@ feature_net() {
     enable_if_defined "CONFIG_$cfg"
   done
 
+  # CIFS 在 clang 23 下的链接错误修正。
+  # fs/cifs/cifs_unicode.h 的 UniStrcat()/UniStrnlen() 是
+  # 「while (*p++); while ((*p++ = *q++));」形式的简单循环，
+  # clang 23 的 LoopIdiomRecognize 会把它识别成 wcslen/wcscpy 调用。
+  # 内核没有这些 libc 符号，链接期报：
+  #   ld.lld: error: undefined symbol: wcslen
+  #   >>> referenced by cifs_unicode.h:122 (fs/cifs/cifs_unicode.h:122)
+  #   >>>               vmlinux.o:(alloc_path_with_tree_prefix)
+  #   make[1]: *** [Makefile:1399: vmlinux] Error 1
+  #
+  # 用 -fno-builtin-wcslen 精确关掉该识别，不影响其他 builtin 优化。
+  # 只在启用了 CONFIG_CIFS 时才改，避免无谓改动。
+  if grep -qE '^CONFIG_CIFS=[ym]$' "$DEFCONFIG"; then
+    CIFS_MK="$KROOT/fs/cifs/Makefile"
+    if [ -f "$CIFS_MK" ]; then
+      if ! grep -q 'fno-builtin-wcslen' "$CIFS_MK"; then
+        {
+          echo ''
+          echo '# clang 23 会把 UniStrcat/UniStrnlen 的 while 循环识别成'
+          echo '# wcslen/wcscpy 调用，而内核没有这些 libc 符号。精确禁用该识别。'
+          echo 'ccflags-y += -fno-builtin-wcslen'
+        } >> "$CIFS_MK"
+        if grep -q 'fno-builtin-wcslen' "$CIFS_MK"; then
+          echo "  已为 fs/cifs/Makefile 追加 -fno-builtin-wcslen"
+        else
+          echo "  [警告] fs/cifs/Makefile 追加 -fno-builtin-wcslen 失败"
+        fi
+      else
+        echo "  fs/cifs/Makefile 已含 -fno-builtin-wcslen"
+      fi
+    else
+      echo "  [警告] 未找到 fs/cifs/Makefile"
+    fi
+  fi
+
   # 写后校验：只在 Kconfig 确实声明了该符号时才要求落盘，
   # 否则「跳过」被误判成「写入失败」。
   if config_defined CONFIG_IP_SET; then
