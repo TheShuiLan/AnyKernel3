@@ -123,6 +123,48 @@ fi
 echo "  KSU commit: $(git -C "$KSU_DIR" rev-parse --short HEAD)"
 [ -d "$KSU_DIR/kernel" ] || def_fail "KernelSU 仓库缺少 kernel/ 目录"
 
+# ---- 2.5 清理源码树里预置的 KernelSU（避免符号重复定义） ----
+#
+# melt-rebase-hyperos 等分支把 tiann 版 KernelSU 直接内建在
+# drivers/staging/kernelsu/（staging/Kconfig:123 引用其 Kconfig）。
+# 若不清掉，我们的接入会与之共存，链接期报大量重复符号：
+#   ld.lld: error: duplicate symbol: ksu_set_app_profile
+#   >>> defined in drivers/built-in.a(staging/kernelsu/allowlist.o)
+#   >>> defined in drivers/built-in.a(kernelsu/ksu_main.o)
+#   make[1]: *** [Makefile:1399: vmlinux] Error 1
+#
+# 这里是"替换"而非"叠加"：先解除 wiring，再删目录/软链。
+PRESET_DIRS=""
+for d in drivers/staging/kernelsu drivers/kernelsu; do
+  if [ -e "$KROOT/$d" ]; then
+    PRESET_DIRS="$PRESET_DIRS $d"
+  fi
+done
+
+if [ -n "$PRESET_DIRS" ]; then
+  echo "  检测到源码树预置的 KernelSU:$PRESET_DIRS，先清理"
+  for d in $PRESET_DIRS; do
+    # 解除 Kconfig 引用（幂等）
+    for kc in drivers/staging/Kconfig drivers/Kconfig; do
+      [ -f "$KROOT/$kc" ] || continue
+      sed -i "\|source \"$d/Kconfig\"|d" "$KROOT/$kc"
+    done
+    # 解除 Makefile 引用（幂等）。
+    # 注意 Makefile 里写的是相对父目录的末级名，不是完整路径：
+    #   drivers/staging/Makefile: obj-$(CONFIG_KSU)		+= kernelsu/
+    #   drivers/Makefile:         obj-y += kernelsu/
+    # 因此按 "+= kernelsu/" 或 "+= kernelsu" 匹配，并容忍 tab/空格分隔。
+    for mk in drivers/staging/Makefile drivers/Makefile; do
+      [ -f "$KROOT/$mk" ] || continue
+      sed -i '/obj-.*+=[[:space:]]*kernelsu\/\{0,1\}[[:space:]]*$/d' "$KROOT/$mk"
+    done
+    # 软链用 rm 只删链接本身；实体目录整棵删除
+    if [ -L "$KROOT/$d" ]; then rm -f "$KROOT/$d"; else rm -rf "$KROOT/$d"; fi
+    echo "    已移除 $d"
+  done
+  # 同名 CONFIG_KSU 会被新接入复用，无需改 defconfig
+fi
+
 # ---- 3. 接入 drivers/kernelsu（按变体选择正确布局） ----
 #
 # 上游各变体的集成布局并不一致，混用会导致头文件找不到：
