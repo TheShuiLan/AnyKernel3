@@ -48,8 +48,20 @@ on:
       kernel_branch:
         description: "源码分支"
         required: false
+        type: choice
+        options:
+          - "melt-rebase-hyperos"
+          - "melt-rebase"
+          - "melt-rebase-los-xiaomi-touch"
+          - "melt-rebase-los-compatible"
+          - "bouquet"
+          - "custom"
+        default: "melt-rebase-hyperos"
+      kernel_branch_custom:
+        description: "自定义源码分支（仅当上面选 custom 时生效）"
+        required: false
         type: string
-        default: "melt-rebase"
+        default: ""
       build_script_branch:
         description: "build_bouquet.sh 所在分支（该脚本仅存在于 bouquet_ci）"
         required: false
@@ -141,6 +153,16 @@ on:
         type: string
         default: ""
 
+      # ==================== 打包模板 ====================
+      package_template:
+        description: "打包模板（决定刷机时接受哪些系统）"
+        required: true
+        type: choice
+        options:
+          - "Marble-Melt（接受原厂 HyperOS / MIUI）"
+          - "Marble-Bouquet（仅 LineageOS 等 OSS 内核 ROM）"
+        default: "Marble-Melt（接受原厂 HyperOS / MIUI）"
+
       # ==================== 安全补丁 ====================
       cve_2026_43499_patch:
         description: "应用 CVE-2026-43499 rtmutex 修复链（内核已含则自动跳过）"
@@ -166,7 +188,8 @@ on:
 
 env:
   KERNEL_REPO: ${{ inputs.kernel_repo }}
-  KERNEL_BRANCH: ${{ inputs.kernel_branch }}
+  # kernel_branch 选 custom 时改用 kernel_branch_custom，否则用选项值
+  KERNEL_BRANCH: ${{ (inputs.kernel_branch == 'custom' && inputs.kernel_branch_custom != '') && inputs.kernel_branch_custom || inputs.kernel_branch }}
   DEFCONFIG: ${{ inputs.defconfig }}
   SLIM_LLVM: ${{ inputs.slim_llvm_version }}
   # 上游脚本的产物目录
@@ -179,7 +202,7 @@ env:
 
 jobs:
   build-marble:
-    name: "Melt ${{ inputs.kernel_branch }}"
+    name: "Melt ${{ inputs.kernel_branch }}${{ inputs.kernel_branch == 'custom' && inputs.kernel_branch_custom != '' && format(' ({0})', inputs.kernel_branch_custom) || '' }}"
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     env:
@@ -195,6 +218,7 @@ jobs:
             echo "|:---|:---|"
             echo "| 源码 | \`$KERNEL_REPO\` |"
             echo "| 分支 | \`$KERNEL_BRANCH\` |"
+            echo "| 打包模板 | \`${{ inputs.package_template }}\` |"
             echo "| 提交 | \`${{ inputs.kernel_commit || 'HEAD' }}\` |"
             echo "| defconfig | \`$DEFCONFIG\` |"
             echo "| 工具链 | Slim LLVM $SLIM_LLVM |"
@@ -837,50 +861,60 @@ jobs:
       - name: 打包 AnyKernel3
         run: |
           set -euo pipefail
-          # 模板用 Marble-Melt：只有它的 anykernel.sh 接受原厂小米系统。
-          # 对比两个分支的 ROM 判定：
+          # 打包模板按输入选择。两个分支的差异：
+          #   Marble-Melt     接受原厂 HyperOS / MIUI（keycode_select 让用户确认），
+          #                   对 MIUI 有完整分支处理（电池/耳机键/msm_drm/
+          #                   camera/ir 各自按 MIUI 取值）；
+          #                   但分支本身缺模块清单，需从 Bouquet 补。
           #   Marble-Bouquet  检测到 MiuiBooster.jar 就 abort "不支持的 rom"，
-          #                   且强制要求 vendor_dlkm 的 xiaomi_touch.ko 含 lineage 字样
-          #                   （只面向 LineageOS 一类的 OSS 内核 ROM）
-          #   Marble-Melt     用 keycode_select 让用户确认系统类型，
-          #                   并对 MIUI 有完整的分支处理（电池/耳机键/msm_drm/
-          #                   camera/ir 等模块各自按 MIUI 取值）
-          #
-          # Melt 分支本身缺模块清单文件（modules.load / modules.load.recovery /
-          # modules.blocklist / modules.options），而它的 make_package.py:186-192
-          # 与 anykernel.sh:453-470 都要读这些文件。这些清单是原厂 HyperOS 的
-          # 模块表，Bouquet 分支里带着，因此从那里补齐。
+          #                   还强制要求 vendor_dlkm 的 xiaomi_touch.ko 含 lineage，
+          #                   只面向 LineageOS / AOSPA 一类的 OSS 内核 ROM；
+          #                   清单文件自带。
           AK_REPO="https://github.com/Pzqqt/AnyKernel3.git"
-          git clone --depth=1 -b Marble-Melt "$AK_REPO" ak3
-          git clone --depth=1 -b Marble-Bouquet "$AK_REPO" ak3-manifest
+          TEMPLATE_RAW="${{ inputs.package_template }}"
+          case "$TEMPLATE_RAW" in
+            Marble-Melt*)   AK_BRANCH="Marble-Melt";    NEED_MANIFEST=1 ;;
+            Marble-Bouquet*) AK_BRANCH="Marble-Bouquet"; NEED_MANIFEST=0 ;;
+            *) echo "::error::未知打包模板: $TEMPLATE_RAW"; exit 1 ;;
+          esac
+          echo "打包模板: $AK_BRANCH（补清单: $NEED_MANIFEST）"
 
-          for part in _vendor_boot_modules _vendor_dlkm_modules; do
-            for f in modules.load modules.load.recovery modules.blocklist modules.options; do
-              src="ak3-manifest/_modules_hyperos/$part/$f"
-              [ -f "$src" ] && cp -f "$src" "ak3/_modules_hyperos/$part/$f"
+          git clone --depth=1 -b "$AK_BRANCH" "$AK_REPO" ak3
+
+          if [ "$NEED_MANIFEST" = "1" ]; then
+            # Melt 无 CI、缺清单文件，从 Bouquet 借（那是原厂 HyperOS 的模块表）
+            git clone --depth=1 -b Marble-Bouquet "$AK_REPO" ak3-manifest
+            for part in _vendor_boot_modules _vendor_dlkm_modules; do
+              for f in modules.load modules.load.recovery modules.blocklist modules.options; do
+                src="ak3-manifest/_modules_hyperos/$part/$f"
+                [ -f "$src" ] && cp -f "$src" "ak3/_modules_hyperos/$part/$f"
+              done
             done
-          done
-          rm -rf ak3-manifest
-
-          echo "=== 补齐后的清单文件 ==="
-          ls -l ak3/_modules_hyperos/_vendor_boot_modules/ ak3/_modules_hyperos/_vendor_dlkm_modules/
+            rm -rf ak3-manifest
+            echo "=== 补齐后的清单文件 ==="
+            ls -l ak3/_modules_hyperos/_vendor_boot_modules/ ak3/_modules_hyperos/_vendor_dlkm_modules/
+          fi
 
           cd ak3
           rm -f ./Image*
 
           # 按上游 CI 的方式填充打包内容
           [ -f ../dist/devicetree/ukee.dtb ] && cp -f ../dist/devicetree/ukee.dtb ./_dtb/dtb
-          # Melt 的 anykernel.sh 需要两份 dtbo：
-          #   is_oss_kernel_rom -> dtbo-1.img
-          #   其余（MIUI/HyperOS）-> dtbo-0.img
-          # 我们整树自编，dtbo 也是自编产物，两条路径都用同一份即可
-          # （原厂模板里两者差异只在 GPU pwrlevels，脚本会在刷机时
-          #  用设备原 dtb 的频率电压表回填，见 copy_gpu_pwrlevels_conf）。
-          if [ -f ../dist/devicetree/dtbo.img ]; then
-            cp -f ../dist/devicetree/dtbo.img ./_dtb/dtbo-0.img
-            cp -f ../dist/devicetree/dtbo.img ./_dtb/dtbo-1.img
-            rm -f ./_dtb/dtbo.img
-            echo "已生成 dtbo-0.img / dtbo-1.img（同一份自编 dtbo）"
+          if [ "$AK_BRANCH" = "Marble-Melt" ]; then
+            # Melt 的 anykernel.sh 需要两份 dtbo：
+            #   is_oss_kernel_rom -> dtbo-1.img
+            #   其余（MIUI/HyperOS）-> dtbo-0.img
+            # 整树自编时 dtbo 也是自编产物，两条路径用同一份即可
+            # （原厂模板中两者的差异只在 GPU pwrlevels，刷机时脚本会用
+            #  设备原 dtb 的频率电压表回填，见 copy_gpu_pwrlevels_conf）。
+            if [ -f ../dist/devicetree/dtbo.img ]; then
+              cp -f ../dist/devicetree/dtbo.img ./_dtb/dtbo-0.img
+              cp -f ../dist/devicetree/dtbo.img ./_dtb/dtbo-1.img
+              rm -f ./_dtb/dtbo.img
+              echo "已生成 dtbo-0.img / dtbo-1.img（同一份自编 dtbo）"
+            fi
+          else
+            [ -f ../dist/devicetree/dtbo.img ] && cp -f ../dist/devicetree/dtbo.img ./_dtb/dtbo.img
           fi
           [ -d ../dist/alt_kernel_modules ] && cp -f ../dist/alt_kernel_modules/* ./_modules_hyperos/_alt/ 2>/dev/null || true
           [ -d ../dist/vendor_boot_modules ] && cp -f ../dist/vendor_boot_modules/* ./_modules_hyperos/_vendor_boot_modules/ 2>/dev/null || true
