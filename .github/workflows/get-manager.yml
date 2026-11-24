@@ -143,7 +143,9 @@ jobs:
 
           if [ "${{ inputs.kernelsu_variant }}" == "SukiSU-Nova" ]; then
             echo "This is the SukiSU-Nova variant"
-            git clone https://git.zako.shirkneko.top:20004/shirkneko/SukiSU.git KernelSU
+            # 注意：不能带 .git 后缀。该 Forgejo 实例对 /<owner>/<repo>.git 的
+            # smart-HTTP 端点返回 401，而不带后缀的 /<owner>/<repo> 可匿名拉取。
+            git clone https://git.zako.shirkneko.top:20004/shirkneko/SukiSU KernelSU
           elif [ "${{ inputs.kernelsu_variant }}" == "BakaSU" ]; then
             echo "This is the BakaSU variant"
             git clone https://github.com/Baka-SU/BakaSU.git KernelSU
