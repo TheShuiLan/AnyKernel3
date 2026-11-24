@@ -704,10 +704,12 @@ jobs:
       - name: 打包 AnyKernel3
         run: |
           set -euo pipefail
-          # 用上游作者本人的 Marble-Melt 模板（含 _dtb / _modules_hyperos /
-          # vendor_boot_fix / bs_patches / make_package.py），
-          # 不要用 osm0sis 通用模板或 WildKernels 的 GKI 模板。
-          git clone --depth=1 -b Marble-Melt https://github.com/Pzqqt/AnyKernel3.git ak3
+          # 用上游 CI 同款模板 Marble-Bouquet。
+          # 注意不能用 Marble-Melt：后者缺少 _modules_hyperos 下的
+          # modules.load / modules.load.recovery / modules.blocklist，
+          # make_package.py 的 [4/9] 模块加载模拟会因 FileNotFoundError 中断；
+          # 且 Marble-Melt 把 VMLINUX_SYMVERS_FILE 写死成作者本地绝对路径。
+          git clone --depth=1 -b Marble-Bouquet https://github.com/Pzqqt/AnyKernel3.git ak3
           cd ak3
           rm -f ./Image*
 
@@ -717,14 +719,18 @@ jobs:
           [ -d ../dist/alt_kernel_modules ] && cp -f ../dist/alt_kernel_modules/* ./_modules_hyperos/_alt/ 2>/dev/null || true
           [ -d ../dist/vendor_boot_modules ] && cp -f ../dist/vendor_boot_modules/* ./_modules_hyperos/_vendor_boot_modules/ 2>/dev/null || true
           [ -d ../dist/vendor_dlkm_modules ] && cp -f ../dist/vendor_dlkm_modules/* ./_modules_hyperos/_vendor_dlkm_modules/ 2>/dev/null || true
+          # Image 与 Image_*_vmlinux.symvers 一并带入（make_package.py 用相对路径引用）
           cp -f ../dist/Image* ./
 
           ls -lh . | head -20
 
-          # make_package.py 把 vmlinux.symvers 路径写死成作者的本地路径，
-          # 需改成实际路径，否则模块加载模拟必然失败
-          SYMVERS="$GITHUB_WORKSPACE/kernel/out/vmlinux.symvers"
-          sed -i "s|^VMLINUX_SYMVERS_FILE = .*|VMLINUX_SYMVERS_FILE = '${SYMVERS}'|" make_package.py
+          # Marble-Bouquet 的 make_package.py 使用相对路径
+          # （VMLINUX_SYMVERS_FILE = 'Image_vmlinux.symvers'），无需改写；
+          # 若上游改回绝对路径，这里兜底改成同级文件名。
+          if grep -q "^VMLINUX_SYMVERS_FILE = '/" make_package.py; then
+            echo "检测到绝对路径，改写为相对路径"
+            sed -i "s|^VMLINUX_SYMVERS_FILE = .*|VMLINUX_SYMVERS_FILE = 'Image_vmlinux.symvers'|" make_package.py
+          fi
           grep -n 'VMLINUX_SYMVERS_FILE =' make_package.py
 
           # main_multi 强制 assert Image 与 Image_ksu 同时存在；
