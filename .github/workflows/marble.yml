@@ -855,6 +855,38 @@ jobs:
           # Image 与 Image_*_vmlinux.symvers 一并带入（make_package.py 用相对路径引用）
           cp -f ../dist/Image* ./
 
+          # 把 mi_cnss_statistic.ko 补进 modules.load。
+          #
+          # 只把它放进模块目录还不够。simulate_load_kernel_modules.py 的
+          # _load_module() 开头有一句：
+          #     if module_path_ not in remain_modules: return True
+          # remain_modules 初始化为 modules.load 的内容，所以不在清单里的
+          # 模块会被当作「已满足」直接跳过，根本不会加载——即使文件在目录、
+          # depmod 也记录了依赖。这就是上一轮补了文件仍报 Unknown symbol 的原因。
+          # 必须同时写进 modules.load，且排在 qca_cld3_qca6490.ko 之前。
+          LOAD_FILE="./_modules_hyperos/_vendor_dlkm_modules/modules.load"
+          if [ -f "$LOAD_FILE" ] && [ -f "../dist/vendor_dlkm_modules/mi_cnss_statistic.ko" ]; then
+            if grep -qxF "mi_cnss_statistic.ko" "$LOAD_FILE"; then
+              echo "modules.load 已含 mi_cnss_statistic.ko"
+            else
+              # 插到首个 qca_cld3_qca6490.ko 之前，保证符号提供者先加载
+              if grep -qxF "qca_cld3_qca6490.ko" "$LOAD_FILE"; then
+                sed -i '0,/^qca_cld3_qca6490\.ko$/s//mi_cnss_statistic.ko\nqca_cld3_qca6490.ko/' "$LOAD_FILE"
+              else
+                # 锚点缺失时追加到末尾（依赖递归仍会处理顺序）
+                echo "mi_cnss_statistic.ko" >> "$LOAD_FILE"
+              fi
+              if grep -qxF "mi_cnss_statistic.ko" "$LOAD_FILE"; then
+                echo "已插入 mi_cnss_statistic.ko 到 modules.load（qca6490 之前）"
+              else
+                echo "::error::mi_cnss_statistic.ko 插入 modules.load 失败"
+                exit 1
+              fi
+            fi
+            echo "=== modules.load 中相关行 ==="
+            grep -n -B1 -A1 "mi_cnss_statistic" "$LOAD_FILE" || true
+          fi
+
           ls -lh . | head -20
 
           # Marble-Bouquet 的 make_package.py 使用相对路径
