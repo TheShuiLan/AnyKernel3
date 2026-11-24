@@ -837,18 +837,51 @@ jobs:
       - name: 打包 AnyKernel3
         run: |
           set -euo pipefail
-          # 用上游 CI 同款模板 Marble-Bouquet。
-          # 注意不能用 Marble-Melt：后者缺少 _modules_hyperos 下的
-          # modules.load / modules.load.recovery / modules.blocklist，
-          # make_package.py 的 [4/9] 模块加载模拟会因 FileNotFoundError 中断；
-          # 且 Marble-Melt 把 VMLINUX_SYMVERS_FILE 写死成作者本地绝对路径。
-          git clone --depth=1 -b Marble-Bouquet https://github.com/Pzqqt/AnyKernel3.git ak3
+          # 模板用 Marble-Melt：只有它的 anykernel.sh 接受原厂小米系统。
+          # 对比两个分支的 ROM 判定：
+          #   Marble-Bouquet  检测到 MiuiBooster.jar 就 abort "不支持的 rom"，
+          #                   且强制要求 vendor_dlkm 的 xiaomi_touch.ko 含 lineage 字样
+          #                   （只面向 LineageOS 一类的 OSS 内核 ROM）
+          #   Marble-Melt     用 keycode_select 让用户确认系统类型，
+          #                   并对 MIUI 有完整的分支处理（电池/耳机键/msm_drm/
+          #                   camera/ir 等模块各自按 MIUI 取值）
+          #
+          # Melt 分支本身缺模块清单文件（modules.load / modules.load.recovery /
+          # modules.blocklist / modules.options），而它的 make_package.py:186-192
+          # 与 anykernel.sh:453-470 都要读这些文件。这些清单是原厂 HyperOS 的
+          # 模块表，Bouquet 分支里带着，因此从那里补齐。
+          AK_REPO="https://github.com/Pzqqt/AnyKernel3.git"
+          git clone --depth=1 -b Marble-Melt "$AK_REPO" ak3
+          git clone --depth=1 -b Marble-Bouquet "$AK_REPO" ak3-manifest
+
+          for part in _vendor_boot_modules _vendor_dlkm_modules; do
+            for f in modules.load modules.load.recovery modules.blocklist modules.options; do
+              src="ak3-manifest/_modules_hyperos/$part/$f"
+              [ -f "$src" ] && cp -f "$src" "ak3/_modules_hyperos/$part/$f"
+            done
+          done
+          rm -rf ak3-manifest
+
+          echo "=== 补齐后的清单文件 ==="
+          ls -l ak3/_modules_hyperos/_vendor_boot_modules/ ak3/_modules_hyperos/_vendor_dlkm_modules/
+
           cd ak3
           rm -f ./Image*
 
           # 按上游 CI 的方式填充打包内容
           [ -f ../dist/devicetree/ukee.dtb ] && cp -f ../dist/devicetree/ukee.dtb ./_dtb/dtb
-          [ -f ../dist/devicetree/dtbo.img ] && cp -f ../dist/devicetree/dtbo.img ./_dtb/dtbo.img
+          # Melt 的 anykernel.sh 需要两份 dtbo：
+          #   is_oss_kernel_rom -> dtbo-1.img
+          #   其余（MIUI/HyperOS）-> dtbo-0.img
+          # 我们整树自编，dtbo 也是自编产物，两条路径都用同一份即可
+          # （原厂模板里两者差异只在 GPU pwrlevels，脚本会在刷机时
+          #  用设备原 dtb 的频率电压表回填，见 copy_gpu_pwrlevels_conf）。
+          if [ -f ../dist/devicetree/dtbo.img ]; then
+            cp -f ../dist/devicetree/dtbo.img ./_dtb/dtbo-0.img
+            cp -f ../dist/devicetree/dtbo.img ./_dtb/dtbo-1.img
+            rm -f ./_dtb/dtbo.img
+            echo "已生成 dtbo-0.img / dtbo-1.img（同一份自编 dtbo）"
+          fi
           [ -d ../dist/alt_kernel_modules ] && cp -f ../dist/alt_kernel_modules/* ./_modules_hyperos/_alt/ 2>/dev/null || true
           [ -d ../dist/vendor_boot_modules ] && cp -f ../dist/vendor_boot_modules/* ./_modules_hyperos/_vendor_boot_modules/ 2>/dev/null || true
           [ -d ../dist/vendor_dlkm_modules ] && cp -f ../dist/vendor_dlkm_modules/* ./_modules_hyperos/_vendor_dlkm_modules/ 2>/dev/null || true
@@ -889,9 +922,11 @@ jobs:
 
           ls -lh . | head -20
 
-          # Marble-Bouquet 的 make_package.py 使用相对路径
-          # （VMLINUX_SYMVERS_FILE = 'Image_vmlinux.symvers'），无需改写；
-          # 若上游改回绝对路径，这里兜底改成同级文件名。
+          # VMLINUX_SYMVERS_FILE 路径修正。
+          # Marble-Melt 里写死成作者本机绝对路径
+          # （/home/pzqqt/working/.../out/vmlinux.symvers），必须改成
+          # 同级文件名 'Image_vmlinux.symvers'——那份符号表已由
+          # ../dist/Image* 拷进本目录。
           if grep -q "^VMLINUX_SYMVERS_FILE = '/" make_package.py; then
             echo "检测到绝对路径，改写为相对路径"
             sed -i "s|^VMLINUX_SYMVERS_FILE = .*|VMLINUX_SYMVERS_FILE = 'Image_vmlinux.symvers'|" make_package.py
