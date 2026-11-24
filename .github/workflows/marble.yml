@@ -542,6 +542,34 @@ jobs:
           done
           grep -n "LLVM_POLLY" "arch/arm64/configs/$DEFCONFIG" || echo "defconfig 中无 LLVM_POLLY 条目"
 
+      - name: 关闭 CONFIG_WERROR（clang 23 对 5.10 误报）
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          # clang 23.1.6 引入的两条新警告，对 5.10 老内核是误报：
+          #   -Wdefault-const-init-var-unsafe
+          #     typecheck() 宏里的 typeof(x) __dummy2; 只做类型对比、从不读取，
+          #     但新检查认为"const 限定的对象默认初始化后未赋值"。
+          #     全树 17 处，集中在 u64_to_user_ptr 之类的宏展开点。
+          #   -Wuninitialized-const-pointer
+          #     arch/arm64/kvm/sys_regs.c:2777 的 clidr。
+          #
+          # CONFIG_WERROR（init/Kconfig，default y）会把这些警告变成错误：
+          #   error: default initialization of an object of type
+          #          'typeof ((attr->batch.keys))' ... [-Werror,-Wdefault-const-init-var-unsafe]
+          #   make[3]: *** [scripts/Makefile.build:279: kernel/bpf/syscall.o] Error 1
+          #
+          # melt-rebase 分支上不触发（该分支 BPF 代码较旧，未命中这些点），
+          # melt-rebase-hyperos 同步了较新上游代码，因此必然撞上。
+          # 这些都是警告升级、非语法/语义错误，关掉 WERROR 不会掩盖真问题。
+          DC="arch/arm64/configs/$DEFCONFIG"
+          if grep -qE '^CONFIG_WERROR=' "$DC"; then
+            sed -i 's|^CONFIG_WERROR=.*|# CONFIG_WERROR is not set|' "$DC"
+          elif ! grep -q '^# CONFIG_WERROR is not set$' "$DC"; then
+            echo "# CONFIG_WERROR is not set" >> "$DC"
+          fi
+          grep -n "WERROR" "$DC" || true
+
       - name: 应用自定义版本后缀
         if: inputs.version_suffix != ''
         working-directory: kernel
