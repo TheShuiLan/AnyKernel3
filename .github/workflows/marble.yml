@@ -297,6 +297,32 @@ jobs:
             rsync unzip wget xz-utils zip zstd
           sudo pip3 install --no-cache-dir rich
 
+      # 编译加速：ccache 缓存编译产物，命中后可显著缩短全量编译时间。
+      # 原流程完全没有配置 ccache（虽装了软件包但未启用），
+      # 每次都是冷编译，约 26 分钟。
+      - name: 恢复 ccache 缓存
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          # 按工具链版本 + 源码分支分组；恢复时允许跨提交复用
+          # （ccache 自身按预处理器哈希判定命中，跨提交是安全的）
+          key: ccache-${{ runner.os }}-${{ inputs.slim_llvm_version }}-${{ inputs.kernel_branch }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ runner.os }}-${{ inputs.slim_llvm_version }}-${{ inputs.kernel_branch }}-
+            ccache-${{ runner.os }}-${{ inputs.slim_llvm_version }}-
+
+      - name: 配置 ccache
+        run: |
+          export PATH="$LLVM_BIN:$PATH"
+          ccache --version
+          ccache --max-size=3G
+          ccache --set-config=compression=true
+          ccache --set-config=compression_level=6
+          # 不同源码树/不同内核配置也能正确区分：ccache 默认按
+          # 预处理后的源码内容 + 编译命令行哈希，天然安全。
+          ccache -z
+          ccache -s
+
       - name: 克隆内核源码
         run: |
           set -euo pipefail
@@ -685,9 +711,20 @@ jobs:
           find "$OUT_DIR" -maxdepth 2 -type d | head -20
 
           mkdir -p dist
-          # 只取三个固定镜像名，避免 Image.base / *_vmlinux.symvers 混入
+          # 三个固定镜像名（避免 Image.base 混入）
           for img in Image Image_ksu Image_susfs; do
             [ -f "$OUT_DIR/$img" ] && cp -f "$OUT_DIR/$img" dist/ || true
+          done
+          # make_package.py 需要 vmlinux.symvers 做模块符号解析，
+          # 优先取与 Image（基础版）对应的那份；单一变体模式下
+          # 只有 SUSFS 版，回退到它。
+          for sv in Image_vmlinux.symvers Image_susfs_vmlinux.symvers \
+                    Image_ksu_vmlinux.symvers; do
+            if [ -f "$OUT_DIR/$sv" ]; then
+              cp -f "$OUT_DIR/$sv" dist/Image_vmlinux.symvers
+              echo "已带入符号表: $sv -> dist/Image_vmlinux.symvers"
+              break
+            fi
           done
           cp -r "$OUT_DIR"/devicetree dist/ 2>/dev/null || true
           cp -r "$OUT_DIR"/alt_kernel_modules dist/ 2>/dev/null || true
