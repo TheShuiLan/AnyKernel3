@@ -460,6 +460,40 @@ jobs:
           echo "=== 校正后清单中的两条 ==="
           grep -E "(goodix_core|xiaomi_touch)\.ko" build_bouquet.sh || true
 
+          # 补入遗漏的 mi_cnss_statistic.ko。
+          # melt-rebase 的 qca_cld3_qca6490.ko（WLAN 驱动）依赖
+          # cnss_statistic_wow_wakeup 与 wow_suspend_type 两个符号，
+          # 二者由 drivers/net/wireless/mi_cnss_statistic/genl.c 导出
+          # （CONFIG_MI_CNSS_STATISTIC=m，在 marble_defconfig 中已启用）。
+          # 但 build_bouquet.sh 的收集清单漏了这个模块，导致它不被 strip、
+          # 不进打包，make_package.py 模拟加载 qca6490 时报 Unknown symbol，
+          # 并连带 39 个下游模块（rmnet_* / audio / msm_drm 等）标为未加载。
+          #
+          # 该模块属 vendor_dlkm 分区（与 qca6490 / cnss_* 同栈），
+          # 因此补进 vendor_dlkm_need_modules，而不是 both_need_modules
+          # （后者会同时落进 vendor_boot_modules，多出无用文件）。
+          MI_CNSS_KO="drivers/net/wireless/mi_cnss_statistic/mi_cnss_statistic.ko"
+          if [ -f "drivers/net/wireless/mi_cnss_statistic/genl.c" ]; then
+            if grep -qxF "$MI_CNSS_KO" build_bouquet.sh; then
+              echo "  mi_cnss_statistic.ko 已在清单中"
+            else
+              # 幂等插入：放在 vendor_dlkm_need_modules 的 qcacld 行之后
+              if grep -qxF "drivers/staging/qcacld-3.0/qca6490.ko" build_bouquet.sh; then
+                sed -i "\|^drivers/staging/qcacld-3\.0/qca6490\.ko\$|a ${MI_CNSS_KO}" build_bouquet.sh
+              else
+                sed -i "s|^vendor_dlkm_need_modules='\$|vendor_dlkm_need_modules='\n${MI_CNSS_KO}|" build_bouquet.sh
+              fi
+              if grep -qxF "$MI_CNSS_KO" build_bouquet.sh; then
+                echo "  已补入 mi_cnss_statistic.ko（vendor_dlkm 分区）"
+              else
+                echo "::error::mi_cnss_statistic.ko 补入失败"
+                exit 1
+              fi
+            fi
+          else
+            echo "  [提示] 源码树无 mi_cnss_statistic 驱动，跳过补入"
+          fi
+
       - name: 应用自定义版本后缀
         if: inputs.version_suffix != ''
         working-directory: kernel
