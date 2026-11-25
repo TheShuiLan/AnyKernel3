@@ -1006,6 +1006,49 @@ jobs:
             grep -n -B1 -A1 "mi_cnss_statistic" "$LOAD_FILE" || true
           fi
 
+          # 清理 modules.load 中指向「本次没编出来的模块」的条目。
+          #
+          # 清单（从 Bouquet 借的原厂模块表）是按上游某个源码状态写的，
+          # 与当前源码分支不一定对得上。例如 melt-rebase-hyperos 删掉了
+          # drivers/staging/kshrink_slabd/，但清单第 100 行仍要求
+          # kshrink_slabd.ko，模拟加载时报：
+          #   Exception: The module file does not exist:
+          #     .../_vendor_boot_modules/kshrink_slabd.ko!
+          #
+          # 做法：逐行检查该模块文件是否真实存在于对应目录，
+          # 不存在则从清单移除并记录。这样源码分支怎么变都不会卡住打包。
+          for pair in "_vendor_boot_modules:0" "_vendor_dlkm_modules:0"; do
+            dir="${pair%%:*}"
+            for mf in "_modules_hyperos/$dir/modules.load" \
+                      "_modules_hyperos/$dir/modules.load.recovery"; do
+              [ -f "$mf" ] || continue
+              removed=0
+              keep="$(mktemp)"
+              while IFS= read -r line || [ -n "$line" ]; do
+                # 清单是 CRLF 行尾，取模块名时要去掉 \r，否则文件名
+                # 带上回车符会被判定为不存在，把整份清单清空。
+                crlf=""
+                case "$line" in *$'\r') crlf=$'\r'; line="${line%$'\r'}" ;; esac
+                case "$line" in
+                  ''|'#'*) printf '%s%s\n' "$line" "$crlf" >> "$keep"; continue ;;
+                  *.ko)
+                    if [ -f "_modules_hyperos/$dir/$line" ]; then
+                      printf '%s%s\n' "$line" "$crlf" >> "$keep"
+                    else
+                      echo "  从 $mf 移除缺失模块: $line"
+                      removed=$((removed + 1))
+                    fi
+                    ;;
+                  *) printf '%s%s\n' "$line" "$crlf" >> "$keep" ;;
+                esac
+              done < "$mf"
+              mv "$keep" "$mf"
+              if [ "$removed" -gt 0 ]; then
+                echo "  $mf 共移除 $removed 条"
+              fi
+            done
+          done
+
           ls -lh . | head -20
 
           # VMLINUX_SYMVERS_FILE 路径修正。
