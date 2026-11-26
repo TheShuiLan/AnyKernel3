@@ -1143,6 +1143,15 @@ jobs:
       REPO_NAME: ${{ github.event.repository.name }}
 
     steps:
+      # release job 里 `gh release create --target <sha>` 需要在 git 仓库
+      # 上下文中执行，否则报：
+      #   failed to run git: fatal: not a git repository
+      # 原工作流缺这一步，release_type 非 Actions 时必然失败。
+      - name: 检出仓库
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
       - name: 下载产物
         uses: actions/download-artifact@v8
         with:
@@ -1177,7 +1186,7 @@ jobs:
           - CVE-2026-43499: ${{ inputs.cve_2026_43499_patch }}
 
           > 刷入前请备份原厂 boot 镜像。" \
-            --target "$GITHUB_SHA" $FLAGS
+            --target "${{ github.sha }}" $FLAGS
 
       - name: 上传资产
         run: |
