@@ -27,6 +27,13 @@ MATRIX_FILES = {
     "android12/5.10": "kernel-a12-5-10.yml",
 }
 
+# 每个矩阵允许出现的 sub_level 白名单。为空表示不限制（保持原行为）。
+# 设置后，sync_matrix_file 只会追加白名单内的子版本，
+# 白名单外的老条目也不会被主动删除——需要精简矩阵时请手工改 yml。
+ALLOWED_SUBLEVELS = {
+    "android12/5.10": {"226", "236", "237"},
+}
+
 ITEM_INDENT = "          - "
 FIELD_INDENT = "            "
 ITEM_PREFIX = "          "  # plain indent used when generating new items
@@ -43,13 +50,18 @@ def _split_include_items(block_lines: list[str]) -> list[list[str]]:
     return items
 
 
-def sync_matrix_file(data: dict, wf_path: Path) -> tuple[bool, list[str], list[str]]:
+def sync_matrix_file(data: dict, wf_path: Path,
+                     allowed: set[str] | None = None) -> tuple[bool, list[str], list[str]]:
     """Append newly published ASB quarters to matrix.include.
 
     Existing entries are left untouched; only entries whose date is newer
     than everything already in the matrix are appended, right before the
     trailing X/lts entry (which is preserved together with any extra
     fields attached to it, e.g. revision). Returns (changed, added, removed).
+
+    When `allowed` is provided, only those sub_levels may be appended;
+    others are skipped even if newer. This keeps a trimmed-down matrix
+    from being re-expanded by the scheduled data update.
     """
     text = wf_path.read_text(encoding="utf-8")
     lines = text.splitlines(keepends=True)
@@ -94,6 +106,8 @@ def sync_matrix_file(data: dict, wf_path: Path) -> tuple[bool, list[str], list[s
         if entry["date"] <= max_date or entry["date"] in existing_dates:
             continue
         sub = entry["kernel"].rsplit(".", 1)[-1]
+        if allowed is not None and sub not in allowed:
+            continue
         new_items.append([f"{ITEM_PREFIX}- sub_level: \"{sub}\"\n",
                           f"{FIELD_INDENT}os_patch_level: \"{entry['date']}\"\n"])
 
@@ -202,7 +216,8 @@ def main() -> int:
             return 1
         data = json.loads(data_file.read_text(encoding="utf-8"))
         try:
-            changed, added, removed = sync_matrix_file(data, wf_path)
+            changed, added, removed = sync_matrix_file(
+                data, wf_path, allowed=ALLOWED_SUBLEVELS.get(rel))
         except ValueError as exc:
             print(f"::error::{exc}", file=sys.stderr)
             return 1
