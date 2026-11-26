@@ -46,17 +46,18 @@ on:
         type: string
         default: "https://github.com/Pzqqt/android_kernel_xiaomi_marble.git"
       kernel_branch:
-        description: "源码分支"
+        description: "源码分支或 tag"
         required: false
         type: choice
         options:
-          - "melt-rebase-hyperos"
+          - "Melt-marble-v5.3（melt-rebase 发布快照，推荐）"
           - "melt-rebase"
+          - "melt-rebase-hyperos"
           - "melt-rebase-los-xiaomi-touch"
           - "melt-rebase-los-compatible"
           - "bouquet"
           - "custom"
-        default: "melt-rebase-hyperos"
+        default: "Melt-marble-v5.3（melt-rebase 发布快照，推荐）"
       kernel_branch_custom:
         description: "自定义源码分支（仅当上面选 custom 时生效）"
         required: false
@@ -188,8 +189,11 @@ on:
 
 env:
   KERNEL_REPO: ${{ inputs.kernel_repo }}
-  # kernel_branch 选 custom 时改用 kernel_branch_custom，否则用选项值
-  KERNEL_BRANCH: ${{ (inputs.kernel_branch == 'custom' && inputs.kernel_branch_custom != '') && inputs.kernel_branch_custom || inputs.kernel_branch }}
+  # kernel_branch 的选项可能带中文注释后缀（如 "Melt-marble-v5.3（...）"），
+  # GitHub Actions 表达式没有 substring-before，无法在这里截断。
+  # 因此这里只处理 custom 与直传两种情况；带后缀的值在
+  # 「解析源码引用」步骤里截断后写回 GITHUB_ENV 覆盖。
+  KERNEL_BRANCH_RAW: ${{ inputs.kernel_branch == 'custom' && inputs.kernel_branch_custom != '' && inputs.kernel_branch_custom || inputs.kernel_branch }}
   DEFCONFIG: ${{ inputs.defconfig }}
   SLIM_LLVM: ${{ inputs.slim_llvm_version }}
   # 上游脚本的产物目录
@@ -209,6 +213,21 @@ jobs:
       CCACHE_DIR: /home/runner/.ccache
 
     steps:
+      - name: 解析源码引用（分支或 tag）
+        run: |
+          # KERNEL_BRANCH_RAW 可能带中文注释后缀，例如
+          #   "Melt-marble-v5.3（melt-rebase 发布快照，推荐）"
+          # 实际 git 引用名是「（」之前的部分。
+          # 截断后写入 GITHUB_ENV，后续步骤的 $KERNEL_BRANCH 即可直接使用。
+          REF="$KERNEL_BRANCH_RAW"
+          case "$REF" in
+            *（*) REF="${REF%%（*}" ;;
+          esac
+          # 去掉可能的尾随空白
+          REF="$(printf '%s' "$REF" | sed -e 's/[[:space:]]*$//')"
+          echo "KERNEL_BRANCH=$REF" >> "$GITHUB_ENV"
+          echo "解析源码引用: '$KERNEL_BRANCH_RAW' -> '$REF'"
+
       - name: 构建信息摘要
         run: |
           {
