@@ -167,11 +167,6 @@ jobs:
       build_channel: ${{ inputs.build_channel }}
       ksu_mode: ${{ inputs.ksu_mode }}
       use_nomount: ${{ inputs.use_nomount }}
-      use_ntsync: ${{ inputs.use_ntsync || false }}
-      use_ddk: ${{ inputs.use_ddk || false }}
-      custom_kernel_options: ${{ inputs.custom_kernel_options || '' }}
-      custom_external_modules: ${{ inputs.custom_external_modules || '' }}
-      kpm_password: ${{ inputs.kpm_password || '' }}
       use_zram: ${{ inputs.use_zram }}
       use_bbg: ${{ inputs.use_bbg }}
       use_net_enhance: ${{ inputs.use_net_enhance }}
