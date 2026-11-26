@@ -26,12 +26,15 @@ KVER="5.10"
 AVER="android12"
 SKIP_INCOMPATIBLE="true"
 PATCHES_ROOT="${GITHUB_WORKSPACE:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
+WLAN_REPO="https://github.com/TheShuiLan/marble-wlan-driver.git"
+WLAN_REF="main"
 
 DO_BBG=0
 DO_REKERNEL=0
 DO_NOMOUNT=0
 DO_ZRAM=0
 DO_NET=0
+DO_WLAN=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -46,6 +49,9 @@ while [ $# -gt 0 ]; do
     --nomount)           DO_NOMOUNT=1; shift ;;
     --zram)              DO_ZRAM=1; shift ;;
     --net-enhance)       DO_NET=1; shift ;;
+    --wlan-fix)          DO_WLAN=1; shift ;;
+    --wlan-repo)         WLAN_REPO="$2"; shift 2 ;;
+    --wlan-ref)          WLAN_REF="$2"; shift 2 ;;
     -h|--help)
       sed -n '2,20p' "${BASH_SOURCE[0]}"
       exit 0 ;;
@@ -558,6 +564,116 @@ feature_net() {
 }
 
 # ================================================================
+# 6. marble WiFi 驱动修复
+#
+# 用 TheShuiLan/marble-wlan-driver 的源码整体替换内核里的 WLAN 驱动栈。
+# 该仓库是从 Melt-marble-v5.3（commit 82fe665b8）提取的原始驱动源码，
+# 覆盖 QCA6490（WCN6855 / FastConnect 6900, Wi-Fi 6E）全链路：
+#
+#   drivers/staging/qcacld-3.0/          CLD 主驱动（HDD / os_if）
+#   drivers/staging/qca-wifi-host-cmn/   host 层（umac/dp/hal/wmi/hif）
+#   drivers/net/wireless/cnss2/          平台驱动（固件加载 / PCIe / QMI）
+#   drivers/net/wireless/cnss_utils/     CNSS 工具接口
+#   drivers/net/wireless/cnss_genl/      generic netlink
+#   drivers/net/wireless/cnss_prealloc/  WLAN 内存预分配
+#   drivers/net/wireless/mi_cnss_statistic/ 小米统计（导出 qca6490 依赖的符号）
+#
+# 采用「整目录覆盖」而非打补丁：这些驱动的补丁量通常极大且上下文易漂移，
+# 仓库提供的正是完整源码树，直接替换最可靠。
+# ================================================================
+WLAN_DIRS="
+drivers/staging/qcacld-3.0
+drivers/staging/qca-wifi-host-cmn
+drivers/net/wireless/cnss2
+drivers/net/wireless/cnss_utils
+drivers/net/wireless/cnss_genl
+drivers/net/wireless/cnss_prealloc
+drivers/net/wireless/mi_cnss_statistic
+"
+
+feature_wlan() {
+  echo "=== [WiFi] marble WLAN 驱动替换 ==="
+
+  local src=/tmp/marble_wlan_src
+  rm -rf "$src"
+  echo "  克隆 $WLAN_REPO ($WLAN_REF)"
+  if ! git clone --depth=1 -b "$WLAN_REF" "$WLAN_REPO" "$src" 2>/dev/null; then
+    rm -rf "$src"
+    if ! git clone --depth=1 "$WLAN_REPO" "$src"; then
+      feat_fail "WiFi 驱动" "仓库克隆失败: $WLAN_REPO"
+      return 0
+    fi
+  fi
+
+  # 前置校验：仓库里必须真的有这些目录，否则不破坏内核树
+  local d missing=""
+  for d in $WLAN_DIRS; do
+    [ -d "$src/$d" ] || missing="$missing $d"
+  done
+  if [ -n "$missing" ]; then
+    rm -rf "$src"
+    feat_fail "WiFi 驱动" "仓库缺少目录:$missing"
+    return 0
+  fi
+  echo "  源码校验通过（$(echo $WLAN_DIRS | wc -w) 个目录）"
+
+  # 备份原始驱动，便于回滚与事后对比
+  local backup="$KROOT/../wlan_backup"
+  rm -rf "$backup"
+  mkdir -p "$backup"
+  for d in $WLAN_DIRS; do
+    if [ -d "$KROOT/$d" ]; then
+      mkdir -p "$backup/$(dirname "$d")"
+      cp -a "$KROOT/$d" "$backup/$d"
+    fi
+  done
+  echo "  原驱动已备份到 $backup"
+
+  # 整目录替换：先删除再复制，确保不残留旧文件
+  local replaced=0
+  for d in $WLAN_DIRS; do
+    rm -rf "$KROOT/$d"
+    mkdir -p "$(dirname "$KROOT/$d")"
+    cp -a "$src/$d" "$KROOT/$d"
+    replaced=$((replaced + 1))
+  done
+  echo "  已替换 $replaced 个驱动目录"
+
+  # 保留仓库自带的 defconfig 片段作为参考（不直接覆盖）
+  if [ -f "$src/config/marble_defconfig" ]; then
+    cp -f "$src/config/marble_defconfig" "$KROOT/../wlan_defconfig.ref"
+    echo "  参考配置已存到 wlan_defconfig.ref"
+  fi
+
+  rm -rf "$src"
+
+  # 校验关键文件确实到位
+  local probe
+  for probe in \
+    drivers/staging/qcacld-3.0/Kbuild \
+    drivers/net/wireless/cnss2/Kconfig \
+    drivers/net/wireless/mi_cnss_statistic/genl.c; do
+    if [ ! -f "$KROOT/$probe" ]; then
+      feat_fail "WiFi 驱动" "替换后缺少关键文件: $probe"
+      return 0
+    fi
+  done
+
+  # WLAN 相关配置：只在 defconfig 里确认存在，不强行改写
+  # （这些配置由内核 defconfig 自带，替换源码不改变开关）
+  local cfg
+  for cfg in CONFIG_QCA_CLD_WLAN CONFIG_CNSS2; do
+    if grep -qE "^${cfg}=[ym]$" "$DEFCONFIG"; then
+      echo "  $cfg 已启用"
+    else
+      echo "  [提示] $cfg 未在 defconfig 中启用，驱动不会被编入"
+    fi
+  done
+
+  echo "  [OK] marble WiFi 驱动已替换"
+}
+
+# ================================================================
 # 主流程
 # ================================================================
 echo "=============================================="
@@ -573,6 +689,7 @@ echo "=============================================="
 [ "$DO_NOMOUNT" = "1" ]  && feature_nomount
 [ "$DO_ZRAM" = "1" ]     && feature_zram
 [ "$DO_NET" = "1" ]      && feature_net
+[ "$DO_WLAN" = "1" ]     && feature_wlan
 
 echo "=============================================="
 if [ "$FAILED" -gt 0 ]; then

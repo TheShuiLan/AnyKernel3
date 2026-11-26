@@ -146,6 +146,21 @@ on:
         required: false
         type: boolean
         default: false
+      wlan_fix:
+        description: "marble WiFi 驱动修复（用 marble-wlan-driver 仓库源码整体替换 QCA6490 WLAN 驱动栈）"
+        required: false
+        type: boolean
+        default: false
+      wlan_repo:
+        description: "WiFi 驱动仓库（wlan_fix=true 时生效）"
+        required: false
+        type: string
+        default: "https://github.com/TheShuiLan/marble-wlan-driver.git"
+      wlan_ref:
+        description: "WiFi 驱动仓库分支/tag（wlan_fix=true 时生效）"
+        required: false
+        type: string
+        default: "main"
 
       # ==================== 构建时间 ====================
       build_time:
@@ -661,30 +676,36 @@ jobs:
             fi
           fi
 
-      - name: 应用功能补丁（BBG / Re-Kernel / NoMount / ZRAM / 网络增强）
+      - name: 应用功能补丁（BBG / Re-Kernel / NoMount / ZRAM / 网络增强 / WiFi）
         working-directory: kernel
         run: |
           set -uo pipefail
-          FEAT_ARGS=""
-          [ "${{ inputs.use_bbg }}" = "true" ]      && FEAT_ARGS="$FEAT_ARGS --bbg"
-          [ "${{ inputs.use_rekernel }}" = "true" ] && FEAT_ARGS="$FEAT_ARGS --rekernel"
-          [ "${{ inputs.use_nomount }}" = "true" ]  && FEAT_ARGS="$FEAT_ARGS --nomount"
-          [ "${{ inputs.use_zram }}" = "true" ]     && FEAT_ARGS="$FEAT_ARGS --zram"
-          [ "${{ inputs.use_net_enhance }}" = "true" ] && FEAT_ARGS="$FEAT_ARGS --net-enhance"
+          # 用数组传参，避免仓库 URL 含特殊字符时的引号问题
+          ARGS=(
+            --kernel-root "$PWD"
+            --defconfig "$DEFCONFIG"
+            --kernel-version 5.10
+            --android-version android12
+            --skip-incompatible "$SKIP_INCOMPATIBLE"
+            --patches-root "$GITHUB_WORKSPACE"
+          )
+          [ "${{ inputs.use_bbg }}" = "true" ]        && ARGS+=(--bbg)
+          [ "${{ inputs.use_rekernel }}" = "true" ]   && ARGS+=(--rekernel)
+          [ "${{ inputs.use_nomount }}" = "true" ]    && ARGS+=(--nomount)
+          [ "${{ inputs.use_zram }}" = "true" ]       && ARGS+=(--zram)
+          [ "${{ inputs.use_net_enhance }}" = "true" ] && ARGS+=(--net-enhance)
+          if [ "${{ inputs.wlan_fix }}" = "true" ]; then
+            ARGS+=(--wlan-fix)
+            ARGS+=(--wlan-repo "${{ inputs.wlan_repo }}")
+            ARGS+=(--wlan-ref  "${{ inputs.wlan_ref }}")
+          fi
 
-          if [ -z "$FEAT_ARGS" ]; then
+          if [ "${#ARGS[@]}" -eq 6 ]; then
             echo "未选择任何功能补丁，跳过"
             exit 0
           fi
 
-          bash "$GITHUB_WORKSPACE/scripts/marble_features/apply.sh" \
-            --kernel-root "$PWD" \
-            --defconfig "$DEFCONFIG" \
-            --kernel-version 5.10 \
-            --android-version android12 \
-            --skip-incompatible "$SKIP_INCOMPATIBLE" \
-            --patches-root "$GITHUB_WORKSPACE" \
-            $FEAT_ARGS
+          bash "$GITHUB_WORKSPACE/scripts/marble_features/apply.sh" "${ARGS[@]}"
 
       - name: 校验构建脚本
         working-directory: kernel
