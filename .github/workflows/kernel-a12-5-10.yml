@@ -95,6 +95,31 @@ on:
         required: false
         type: boolean
         default: false
+      use_ntsync:
+        description: "启用独立 NTsync 支持（Wine/Proton 同步原语）"
+        required: false
+        type: boolean
+        default: false
+      use_ddk:
+        description: "启用 Xingguang DDK 防格机 LSM"
+        required: false
+        type: boolean
+        default: false
+      custom_kernel_options:
+        description: "追加自定义内核配置，每行一条（如 CONFIG_FOO=y）"
+        required: false
+        type: string
+        default: ""
+      custom_external_modules:
+        description: "外挂内核模块仓库 URL"
+        required: false
+        type: string
+        default: ""
+      kpm_password:
+        description: "KPM 超级密码（仅 SukiSU-Nova / BakaSU 且 use_kpm=true 时生效）"
+        required: false
+        type: string
+        default: ""
       cve_2026_43499_patch:
         description: "应用 CVE-2026-43499 rtmutex 修复链"
         required: false
@@ -144,6 +169,26 @@ on:
         required: false
         type: boolean
         default: false
+      use_ntsync:
+        required: false
+        type: boolean
+        default: false
+      use_ddk:
+        required: false
+        type: boolean
+        default: false
+      custom_kernel_options:
+        required: false
+        type: string
+        default: ""
+      custom_external_modules:
+        required: false
+        type: string
+        default: ""
+      kpm_password:
+        required: false
+        type: string
+        default: ""
       cve_2026_43499_patch:
         required: false
         type: boolean
@@ -236,6 +281,11 @@ jobs:
       use_kpm: ${{ inputs.use_kpm || false }}
       use_rekernel: ${{ inputs.use_rekernel || false }}
       use_nomount: ${{ inputs.use_nomount || false }}
+      use_ntsync: ${{ inputs.use_ntsync || false }}
+      use_ddk: ${{ inputs.use_ddk || false }}
+      custom_kernel_options: ${{ inputs.custom_kernel_options || '' }}
+      custom_external_modules: ${{ inputs.custom_external_modules || '' }}
+      kpm_password: ${{ inputs.kpm_password || '' }}
       cve_2026_43499_patch: ${{ inputs.cve_2026_43499_patch }}
       supp_op: false
       enable_susfs: ${{ inputs.ksu_mode != '禁用SUSFS' && inputs.ksu_mode != '禁用KSU' }}

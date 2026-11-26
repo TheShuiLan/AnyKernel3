@@ -117,6 +117,32 @@ on:
         required: false
         type: boolean
         default: false
+      # ===== 以下五项移植自 ABK（AnyBase Kernel）=====
+      use_ntsync:
+        description: "启用独立 NTsync 支持（Wine/Proton 同步原语，来自 WildKernels/kernel_patches）"
+        required: false
+        type: boolean
+        default: false
+      use_ddk:
+        description: "启用 Xingguang DDK（防格机 LSM，拦截块设备擦除类写入）"
+        required: false
+        type: boolean
+        default: false
+      custom_kernel_options:
+        description: "追加自定义内核配置，每行一条（如 CONFIG_FOO=y 或 # CONFIG_BAR is not set）"
+        required: false
+        type: string
+        default: ""
+      custom_external_modules:
+        description: "外挂内核模块仓库 URL（构建后在 after_patch 阶段编译并打包）"
+        required: false
+        type: string
+        default: ""
+      kpm_password:
+        description: "KPM 超级密码（仅 SukiSU-Nova / BakaSU 且 use_kpm=true 时生效）"
+        required: false
+        type: string
+        default: ""
       skip_incompatible:
         description: "功能不兼容或无法使用时自动跳过该功能（不中断构建）"
         required: false
@@ -805,6 +831,202 @@ jobs:
 
       - name: 备份基准 defconfig
         run: cp "$DEFCONFIG" "$DEFCONFIG.orig"
+
+      - name: 应用 NTsync 补丁
+        if: inputs.use_ntsync
+        working-directory: ${{ env.KERNEL_ROOT }}/common
+        env:
+          ABK_ANDROID_VERSION: ${{ inputs.android_version }}
+          ABK_KERNEL_VERSION: ${{ inputs.kernel_version }}
+        run: |
+          set -euo pipefail
+
+          ensure_defconfig_value() {
+            local cfg="$1"
+            local value="$2"
+            local line="${cfg}=${value}"
+
+            if grep -qxF "$line" "$DEFCONFIG"; then
+              return 0
+            fi
+
+            if grep -Eq "^${cfg}=|^# ${cfg} is not set$" "$DEFCONFIG"; then
+              sed -i -E "s|^${cfg}=.*|${line}|; s|^# ${cfg} is not set$|${line}|" "$DEFCONFIG"
+            else
+              echo "$line" >> "$DEFCONFIG"
+            fi
+          }
+
+          echo "启用 NTsync 补丁"
+          BASE_PATCH="$KERNEL_PATCHES/common/ntsync/ntsync_base.patch"
+          PATCH_FILE="$KERNEL_PATCHES/common/ntsync/ntsync_compat_${ABK_ANDROID_VERSION}-${ABK_KERNEL_VERSION}.patch"
+          NTSYNC_SOURCE="drivers/misc/ntsync.c"
+
+          apply_ntsync_patch() {
+            local patch_file="$1"
+            [ -f "$patch_file" ] || {
+              echo "::error::NTsync 补丁不存在: $patch_file"
+              exit 1
+            }
+            echo "检查并应用 NTsync 补丁: $(basename "$patch_file")"
+            if patch -p1 --forward --dry-run < "$patch_file" >/dev/null 2>&1; then
+              patch -p1 --forward < "$patch_file"
+            elif patch -p1 --reverse --dry-run < "$patch_file" >/dev/null 2>&1; then
+              echo "NTsync 补丁已应用: $(basename "$patch_file")"
+            else
+              echo "::error::NTsync 补丁既无法应用，也不是已应用状态: $patch_file"
+              exit 1
+            fi
+          }
+
+          # Android 12 / 5.10 需要裁剪上游补丁中与当前内核不匹配的 hunk
+          apply_android12_ntsync_compat() {
+            local source_patch="$1"
+            local filtered_patch filtered
+
+            [ -f "$source_patch" ] || {
+              echo "::error::Android 12 NTsync 兼容补丁不存在: $source_patch"
+              exit 1
+            }
+
+            filtered="$(mktemp)"
+            filtered_patch="$filtered"
+
+            python3 - "$source_patch" "$filtered_patch" <<'PY'
+          import sys
+          from pathlib import Path
+
+          source = Path(sys.argv[1]).read_text()
+
+          start = source.find("@@ -305,25 +310,29")
+          end = source.find("@@ -394,8 +403,12", start)
+          if start < 0 or end < 0:
+              raise SystemExit("unexpected android12 NTsync compatibility patch layout")
+          source = source[:start] + source[end:]
+
+          lockdep = Path("kernel/locking/lockdep.c").read_text()
+          function_pos = lockdep.find("int __lock_is_held")
+          function_line = lockdep[:function_pos].count("\n") + 1 if function_pos >= 0 else 99999
+          if function_line < 5250:
+              lockdep_start = source.find("@@ -5308,13 +5309,13")
+              lockdep_end = source.find("@@ -5593,10 +5594,14", lockdep_start)
+              if lockdep_start < 0 or lockdep_end < 0:
+                  raise SystemExit("unexpected android12 NTsync lockdep.c patch layout")
+              source = source[:lockdep_start] + source[lockdep_end:]
+          Path(sys.argv[2]).write_text(source)
+          PY
+            apply_ntsync_patch "$filtered_patch"
+            rm -f "$filtered_patch"
+
+            python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("include/linux/lockdep.h")
+          text = path.read_text()
+          if "#define lockdep_assert(cond)" not in text:
+              marker = "#define lockdep_depth(tsk)\t(debug_locks ? (tsk)->lockdep_depth : 0)\n"
+              if marker not in text:
+                  raise SystemExit(f"missing lockdep assertion anchor: {path}")
+              block = "\n#define lockdep_assert(cond) \\\n    do { WARN_ON(debug_locks && !(cond)); } while (0)\n\n#define lockdep_assert_once(cond) \\\n    do { WARN_ON_ONCE(debug_locks && !(cond)); } while (0)\n"
+              path.write_text(text.replace(marker, marker + block, 1))
+
+          lockdep_path = Path("kernel/locking/lockdep.c")
+          lockdep = lockdep_path.read_text()
+          function_start = lockdep.find("int __lock_is_held(const struct lockdep_map *lock, int read)")
+          function_end = lockdep.find("static struct pin_cookie __lock_pin_lock", function_start)
+          if function_start >= 0 and function_end >= 0:
+              body = lockdep[function_start:function_end]
+              if "return LOCK_STATE_HELD;" not in body:
+                  body = body.replace("return 1;", "return LOCK_STATE_HELD;", 1)
+                  body = body.replace("return 0;", "return LOCK_STATE_NOT_HELD;")
+                  lockdep_path.write_text(lockdep[:function_start] + body + lockdep[function_end:])
+          PY
+            grep -qF '#define lockdep_assert(cond)' include/linux/lockdep.h || {
+              echo "::error::Android 12 NTsync lockdep_assert 兼容修复失败"
+              exit 1
+            }
+          }
+
+          # Android 16/6.12 与 Android 17/6.18 已带原生 ntsync.c 与 UAPI；
+          # 基础补丁是新增文件式补丁，对原生源码既不能正向应用，
+          # 也不能用反向 dry-run 判定为已应用。
+          NATIVE_NTSYNC="false"
+          if [[ "$ABK_ANDROID_VERSION" == "android16" && "$ABK_KERNEL_VERSION" == "6.12" ]] \
+            || [[ "$ABK_ANDROID_VERSION" == "android17" && "$ABK_KERNEL_VERSION" == "6.18" ]]; then
+            NATIVE_NTSYNC="true"
+          fi
+
+          if [ "$NATIVE_NTSYNC" != "true" ]; then
+            apply_ntsync_patch "$BASE_PATCH"
+          elif [ -f "$NTSYNC_SOURCE" ] && [ -f include/uapi/linux/ntsync.h ]; then
+            echo "NTsync 基础源码已由 ${ABK_ANDROID_VERSION}-${ABK_KERNEL_VERSION} 内核提供"
+          else
+            echo "::error::${ABK_ANDROID_VERSION}-${ABK_KERNEL_VERSION} 内核缺少原生 NTsync 源码或 UAPI"
+            exit 1
+          fi
+          if [[ "$ABK_ANDROID_VERSION" == "android12" && "$ABK_KERNEL_VERSION" == "5.10" ]]; then
+            apply_android12_ntsync_compat "$PATCH_FILE"
+          elif [ "$ABK_ANDROID_VERSION" = "android17" ] && [ "$ABK_KERNEL_VERSION" = "6.18" ] \
+            && [ ! -f "$PATCH_FILE" ]; then
+            echo "::warning::未找到 ${ABK_ANDROID_VERSION}-${ABK_KERNEL_VERSION} 的 NTsync 兼容补丁 ($(basename "$PATCH_FILE"))，按内核原生实现继续。"
+          else
+            apply_ntsync_patch "$PATCH_FILE"
+          fi
+
+          [ -f "$NTSYNC_SOURCE" ] || {
+            echo "::error::NTsync 补丁完成后未生成 $NTSYNC_SOURCE"
+            exit 1
+          }
+
+          # 强制内建可避免 Android 14/6.1 将 ntsync.ko modpost 为独立模块；
+          # __vfs_setxattr_noperm 在该内核树中存在但未导出，内建对象可合法引用。
+          ensure_defconfig_value CONFIG_NTSYNC y
+          echo "应用 NTsync 补丁完成"
+
+      - name: 添加 Xingguang DDK 防格机 LSM
+        if: inputs.use_ddk
+        working-directory: ${{ env.KERNEL_ROOT }}
+        run: |
+          set -euo pipefail
+          # DDK（Xingguang-DDK）在 security/ 下注册内建 LSM，
+          # 拦截块设备的擦除类写入，防止恶意程序把机器写坏（"格机"）。
+          # setup.sh 以 pwd 为 GKI_ROOT，自动识别 security/ 或 common/security/。
+          DDK_SETUP="$ZZH_PATCHES/ddk/setup.sh"
+          if [ ! -f "$DDK_SETUP" ]; then
+            if [ "$SKIP_INCOMPATIBLE" = "true" ]; then
+              echo "::warning title=DDK 已跳过::找不到 $DDK_SETUP"
+              echo "DDK_SKIPPED=true" >> "$GITHUB_ENV"
+              exit 0
+            fi
+            echo "::error::找不到 DDK 安装脚本: $DDK_SETUP"
+            exit 1
+          fi
+
+          if ! bash "$DDK_SETUP"; then
+            if [ "$SKIP_INCOMPATIBLE" = "true" ]; then
+              echo "::warning title=DDK 已跳过::setup.sh 执行失败（可能不适配当前内核目录结构）"
+              echo "DDK_SKIPPED=true" >> "$GITHUB_ENV"
+              exit 0
+            fi
+            echo "::error::DDK 集成失败"
+            exit 1
+          fi
+
+          DDK_HEADER="common/include/linux/xingguang_ddk.h"
+          [ -f "$DDK_HEADER" ] || DDK_HEADER="include/linux/xingguang_ddk.h"
+          if [ ! -f "$DDK_HEADER" ]; then
+            if [ "$SKIP_INCOMPATIBLE" = "true" ]; then
+              echo "::warning title=DDK 已跳过::未生成 xingguang_ddk.h"
+              echo "DDK_SKIPPED=true" >> "$GITHUB_ENV"
+              exit 0
+            fi
+            echo "::error::DDK 集成后未生成 xingguang_ddk.h"
+            exit 1
+          fi
+
+          grep -q '^CONFIG_XINGGUANG_DDK=y$' "$DEFCONFIG" \
+            || echo "CONFIG_XINGGUANG_DDK=y" >> "$DEFCONFIG"
+          echo "DDK 集成完成（$DDK_HEADER）"
 
       - name: 集成 NoMount 挂载元模块
         if: inputs.use_nomount
@@ -1651,6 +1873,129 @@ jobs:
           fi
           echo "::error::Re-Kernel 集成失败"
           exit 1
+
+      - name: 应用自定义内核选项
+        if: inputs.custom_kernel_options != ''
+        working-directory: ${{ env.KERNEL_ROOT }}
+        env:
+          CUSTOM_KERNEL_OPTIONS: ${{ inputs.custom_kernel_options }}
+        run: |
+          set -euo pipefail
+          # 解析用户提供的配置行并写入 defconfig。
+          # 支持三种形式：
+          #   CONFIG_FOO=y            -> 启用
+          #   CONFIG_FOO=m            -> 编译为模块
+          #   # CONFIG_FOO is not set -> 禁用
+          #   CONFIG_FOO="string"/123 -> 原样写入
+          # 每条都会先用 Kconfig 校验符号是否存在，不存在则跳过并告警，
+          # 避免像 bazel fragment 那样因未定义符号导致配置校验失败。
+          python3 - <<'PY'
+          import os
+          import re
+          import subprocess
+          from pathlib import Path
+
+          defconfig = Path(os.environ["DEFCONFIG"])
+          config_files = [defconfig]
+
+          text_by_path = {path: path.read_text().splitlines() for path in config_files}
+          lines = os.environ["CUSTOM_KERNEL_OPTIONS"].replace("\r", "").splitlines()
+
+          parsed = []
+          disabled_re = re.compile(r"^#\s*(CONFIG_[A-Za-z0-9_]+)\s+is\s+not\s+set$", re.I)
+          assigned_re = re.compile(r"^(CONFIG_[A-Za-z0-9_]+)=(.+)$")
+
+          def normalize_symbol(raw: str) -> str:
+              candidate = raw.strip().replace(" ", "")
+              if not candidate:
+                  return ""
+              if not candidate.upper().startswith("CONFIG_"):
+                  candidate = f"CONFIG_{candidate}"
+              candidate = candidate.upper()
+              if not re.fullmatch(r"CONFIG_[A-Z0-9_]+", candidate):
+                  return ""
+              return candidate
+
+          def config_defined(symbol: str) -> bool:
+              name = symbol.removeprefix("CONFIG_")
+              result = subprocess.run(
+                  ["bash", "-lc",
+                   "find . -type f -name 'Kconfig*' -print0 | xargs -0 grep -El "
+                   "\"^[[:space:]]*(menuconfig|config)[[:space:]]+" + name + "([[:space:]]|$)\" >/dev/null"],
+                  cwd=os.getcwd(),
+              )
+              return result.returncode == 0
+
+          def set_config_value(text_lines, symbol: str, mode: str, value: str = ""):
+              clean = symbol.removeprefix("CONFIG_")
+              filtered = []
+              for line in text_lines:
+                  if re.match(rf"^(CONFIG_{re.escape(clean)}=|# CONFIG_{re.escape(clean)} is not set$)", line):
+                      continue
+                  filtered.append(line)
+              if mode == "disabled":
+                  filtered.append(f"# CONFIG_{clean} is not set")
+              elif mode == "raw":
+                  filtered.append(f"CONFIG_{clean}={value}")
+              else:
+                  filtered.append(f"CONFIG_{clean}={mode}")
+              return filtered
+
+          for raw in lines:
+              clean = raw.strip()
+              if not clean:
+                  continue
+              if clean.startswith("#") and not clean.startswith("# CONFIG_"):
+                  continue
+              disabled = disabled_re.match(clean)
+              assigned = assigned_re.match(clean)
+              if disabled:
+                  symbol = normalize_symbol(disabled.group(1))
+                  if symbol:
+                      parsed.append((symbol, "disabled", ""))
+                  continue
+              if assigned:
+                  symbol = normalize_symbol(assigned.group(1))
+                  value = assigned.group(2).strip()
+                  if not symbol:
+                      print(f"::warning::无效自定义内核选项，已跳过: {clean}")
+                      continue
+                  if value.lower() == "y":
+                      parsed.append((symbol, "y", ""))
+                  elif value.lower() == "m":
+                      parsed.append((symbol, "m", ""))
+                  elif value.lower() == "n":
+                      parsed.append((symbol, "disabled", ""))
+                  else:
+                      parsed.append((symbol, "raw", value))
+                  continue
+              print(f"::warning::无法识别的自定义内核选项行，已跳过: {clean}")
+
+          # 同一符号多次出现时以最后一行为准
+          deduped = []
+          seen = set()
+          for symbol, mode, value in reversed(parsed):
+              if symbol in seen:
+                  continue
+              seen.add(symbol)
+              deduped.append((symbol, mode, value))
+          deduped.reverse()
+
+          applied = 0
+          skipped = 0
+          for symbol, mode, value in deduped:
+              if not config_defined(symbol):
+                  print(f"::warning::{symbol} 未在 Kconfig 中定义，已跳过")
+                  skipped += 1
+                  continue
+              for path in config_files:
+                  text_by_path[path] = set_config_value(text_by_path[path], symbol, mode, value)
+              applied += 1
+
+          for path, text_lines in text_by_path.items():
+              path.write_text("\n".join(text_lines) + "\n")
+          print(f"自定义内核选项: 应用 {applied} 条，跳过 {skipped} 条")
+          PY
 
       - name: 配置内核选项
         working-directory: ${{ env.KERNEL_ROOT }}

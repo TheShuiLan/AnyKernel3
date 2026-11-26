@@ -116,6 +116,29 @@ on:
         description: "启用 NoMount 挂载元模块（需自行刷入配套模块）"
         type: boolean
         default: false
+      use_ntsync:
+        description: "启用独立 NTsync 支持（Wine/Proton 同步原语）"
+        type: boolean
+        default: false
+      use_ddk:
+        description: "启用 Xingguang DDK 防格机 LSM"
+        type: boolean
+        default: false
+      custom_kernel_options:
+        description: "追加自定义内核配置，每行一条（如 CONFIG_FOO=y）"
+        type: string
+        default: ""
+        required: false
+      custom_external_modules:
+        description: "外挂内核模块仓库 URL"
+        type: string
+        default: ""
+        required: false
+      kpm_password:
+        description: "KPM 超级密码（仅 SukiSU-Nova / BakaSU 且 use_kpm=true 时生效）"
+        type: string
+        default: ""
+        required: false
       cve_2026_43499_patch:
         description: "应用 CVE-2026-43499 rtmutex 修复链"
         type: boolean
@@ -144,6 +167,11 @@ jobs:
       build_channel: ${{ inputs.build_channel }}
       ksu_mode: ${{ inputs.ksu_mode }}
       use_nomount: ${{ inputs.use_nomount }}
+      use_ntsync: ${{ inputs.use_ntsync || false }}
+      use_ddk: ${{ inputs.use_ddk || false }}
+      custom_kernel_options: ${{ inputs.custom_kernel_options || '' }}
+      custom_external_modules: ${{ inputs.custom_external_modules || '' }}
+      kpm_password: ${{ inputs.kpm_password || '' }}
       use_zram: ${{ inputs.use_zram }}
       use_bbg: ${{ inputs.use_bbg }}
       use_net_enhance: ${{ inputs.use_net_enhance }}
@@ -178,6 +206,11 @@ jobs:
       use_kpm: ${{ inputs.use_kpm }}
       use_rekernel: ${{ inputs.use_rekernel }}
       use_nomount: ${{ inputs.use_nomount }}
+      use_ntsync: ${{ inputs.use_ntsync || false }}
+      use_ddk: ${{ inputs.use_ddk || false }}
+      custom_kernel_options: ${{ inputs.custom_kernel_options || '' }}
+      custom_external_modules: ${{ inputs.custom_external_modules || '' }}
+      kpm_password: ${{ inputs.kpm_password || '' }}
       cve_2026_43499_patch: ${{ inputs.cve_2026_43499_patch }}
       ksu_mode: ${{ inputs.ksu_mode }}
       droidspaces: ${{ startsWith(inputs.droidspaces, '678') && '678' || startsWith(inputs.droidspaces, '123') && '123' || startsWith(inputs.droidspaces, '345') && '345' || 'off' }}
